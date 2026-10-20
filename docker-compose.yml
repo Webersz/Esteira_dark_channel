@@ -1,0 +1,79 @@
+x-app: &app
+  build: .
+  env_file: .env
+  restart: unless-stopped
+  volumes:
+    - ./config:/app/config
+    - ./credentials:/app/credentials
+    - ./media_assets:/app/media_assets
+    - ./output:/app/output
+    - models:/models
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      TZ: ${TZ}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-shot bootstrap: creates DB tables + synthetic SFX/BGM/overlay if missing
+  bootstrap:
+    <<: *app
+    restart: "no"
+    command: ["sh", "-c", "python generate_sfx.py && python -c 'from src.database import init_db; init_db()'"]
+
+  # Heavy CPU work (Gemini -> TTS -> Whisper -> Flux -> rembg -> FFmpeg). Keep concurrency low.
+  worker-render:
+    <<: *app
+    command: ["celery", "-A", "src.tasks", "worker", "-Q", "render", "-c", "1", "-n", "render@%h", "--loglevel=INFO"]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+
+  # Publishing (YouTube API + TikTok Playwright). Concurrency 1 so browser profiles never collide.
+  worker-publish:
+    <<: *app
+    shm_size: "2gb"
+    command: ["celery", "-A", "src.tasks", "worker", "-Q", "publish", "-c", "1", "-n", "publish@%h", "--loglevel=INFO"]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+
+  beat:
+    <<: *app
+    command: ["celery", "-A", "src.tasks", "beat", "--loglevel=INFO", "--schedule=/app/output/celerybeat-schedule"]
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
+  redisdata:
+  models:
