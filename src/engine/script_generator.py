@@ -24,13 +24,13 @@ TWIST_SCENE = 7  # 1-based, lands around the 25 s mark
 # Rotated per video (anti format fatigue). Each rule is injected for scene 1 only.
 HOOK_ARCHETYPES: dict[str, str] = {
     "IN_MEDIA_RES": "Start at the exact millisecond of catastrophe, failure or peak emotional breakdown, with zero "
-                    "introductory context. Example: 'Faltavam exatos 4 segundos para a valvula explodir quando...'",
+                    "introductory context. Example: 'Faltavam exatos 4 segundos para a válvula explodir quando...'",
     "MITO_QUEBRADO": "Open by contradicting a belief the audience holds, to trigger cognitive dissonance. "
-                     "Example: 'Se voce acha que fazer isso vai salvar sua vida, voce acabou de assinar sua sentenca...'",
+                     "Example: 'Se você acha que fazer isso vai salvar sua vida, você acabou de assinar sua sentença...'",
     "NUMERO_ESPECIFICO": "Open with a hyper-specific, bizarre financial or technical number. "
-                         "Example: 'Por causa de 42 milhoes de reais e uma linha de codigo esquecida as 3 da manha...'",
+                         "Example: 'Por causa de 42 milhões de reais e uma linha de código esquecida às 3 da manhã...'",
     "CONFRONTO_DIRETO": "Address the viewer directly with an urgent command or physiological trigger. "
-                        "Example: 'Nao pisque pelos proximos 4 segundos e olhe para o canto dessa imagem...'",
+                        "Example: 'Não pisque pelos próximos 4 segundos e olhe para o canto dessa imagem...'",
 }
 
 _client: genai.Client | None = None
@@ -52,12 +52,14 @@ You write scripts engineered for maximum retention on YouTube Shorts and TikTok:
 - Scene 1 is a pattern-interrupt hook that creates an open loop in the first 2 seconds (no greetings, no "hoje vamos").
 - Every scene adds new information or tension; no filler, no repetition.
 - Scene 7 (~25 s) is a mandatory retention reset: a sudden complication, betrayal or unexpected discovery
-  ("Mas o que ninguem sabia e que..."). Re-hook again around scene 11.
+  ("Mas o que ninguém sabia é que..."). Re-hook again around scene 11.
 - Scenes 16 and 1 form ONE continuous sentence (infinite loop): scene 16 delivers the climax/resolution in its
-  first 7 words and ends with an open connector phrase ("...e tudo isso so aconteceu porque no comeco...",
-  "...e o motivo real disso tudo e que...") WITHOUT a final period, so it flows grammatically into scene 1.
+  first 7 words and ends with an open connector phrase ("...e tudo isso só aconteceu porque no começo...",
+  "...e o motivo real disso tudo é que...") WITHOUT a final period, so it flows grammatically into scene 1.
 - No "se inscreva" / "siga" calls anywhere: they break the loop.
 - Narration is plain spoken text: no emojis, no markdown, no brackets, no stage directions, numbers written as words when short.
+- Write narration, title, description and comment with FULL, correct accentuation and cedilla (é, ã, ç, ô...).
+  The voice-over engine mispronounces unaccented words ("e" vs "é", "mascaras" vs "máscaras").
 - Image prompts are in English, cinematic, vertical 9:16, describe a single clear focal subject, and never contain text.
 """
 

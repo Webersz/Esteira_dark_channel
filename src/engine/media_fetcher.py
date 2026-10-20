@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import io
 import json
@@ -72,6 +73,32 @@ def _valid_image(data: bytes | None, min_side: int = 512) -> Image.Image | None:
 
 TIER1_BACKOFF = (2, 5, 10)  # seconds after Flux attempts 1, 2, 3
 TIER2_ATTEMPTS = 2  # Turbo attempts 4 and 5
+# Anonymous Pollinations tier: 1 image / 45 s per IP (HTTP 402 FREE_LIMIT otherwise). A pollen key removes it.
+ANON_INTERVAL_S = 46.0
+
+_throttle_lock: asyncio.Lock | None = None
+_last_request = 0.0
+
+
+@contextlib.asynccontextmanager
+async def _anon_slot():
+    """Serialize anonymous Pollinations requests and space them ANON_INTERVAL_S after the previous one
+    *finished* (the free-tier window is counted from generation end). No-op with POLLINATIONS_TOKEN."""
+    global _throttle_lock, _last_request
+    if get_settings().pollinations_token:
+        yield
+        return
+    if _throttle_lock is None:
+        _throttle_lock = asyncio.Lock()
+    async with _throttle_lock:
+        loop = asyncio.get_running_loop()
+        wait = _last_request + ANON_INTERVAL_S - loop.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        try:
+            yield
+        finally:
+            _last_request = loop.time()
 
 
 async def _pollinations_image(session, sem, prompt: str, seed: int, dest: Path, w: int = 1080, h: int = 1920) -> bool:
@@ -83,7 +110,8 @@ async def _pollinations_image(session, sem, prompt: str, seed: int, dest: Path, 
     plan += [("turbo", seed + random.randint(1, 9999), 0) for _ in range(TIER2_ATTEMPTS)]
     for attempt, (model, current_seed, wait) in enumerate(plan, start=1):
         url = POLLINATIONS_URL.format(prompt=encoded, w=w, h=h, seed=current_seed, model=model)
-        img = _valid_image(await _fetch_bytes(session, url, sem, headers=headers, retries=1))
+        async with _anon_slot():
+            img = _valid_image(await _fetch_bytes(session, url, sem, headers=headers, retries=1))
         if img is not None:
             img.save(dest, "JPEG", quality=94)
             if attempt > 1:
@@ -212,7 +240,13 @@ async def _fetch_scene(i, scene, channel: ChannelConfig, assets_dir: Path, sessi
 async def fetch_scene_assets(script: VideoScript, channel: ChannelConfig, workdir: Path) -> list[SceneAsset]:
     assets_dir = workdir / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
+    global _throttle_lock
+    _throttle_lock = None  # asyncio.Lock is bound to the event loop; each asyncio.run() gets a fresh one
     base_seed = int(hashlib.md5(script.topic.encode()).hexdigest()[:7], 16)
+    if not get_settings().pollinations_token:
+        n = len(script.scenes) + sum(bool(s.character_pose) for s in script.scenes) * channel.is_character_channel
+        log.info("[%s] no POLLINATIONS_TOKEN: anonymous tier paced at 1 image/%.0fs (~%.0f min for %d images)",
+                 channel.id, ANON_INTERVAL_S, n * ANON_INTERVAL_S / 60, n)
     rng = random.Random(base_seed)
     sem = asyncio.Semaphore(get_settings().image_concurrency)
     used_ids: set[int] = set()

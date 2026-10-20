@@ -1,0 +1,9 @@
+.git
+.env
+.venv
+credentials
+output
+output_test
+reports
+**/__pycache__
+**/*.pyc

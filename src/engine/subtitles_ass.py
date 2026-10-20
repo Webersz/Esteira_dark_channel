@@ -1,8 +1,10 @@
 """faster-whisper word timestamps -> SubStation Alpha (.ass) word-by-word karaoke highlight."""
 from __future__ import annotations
 
+import difflib
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,6 +59,46 @@ def transcribe_words(audio_path: Path, language: str, reference_text: str = "") 
         if cur.end <= cur.start:
             cur.end = cur.start + 0.05
     return words
+
+
+def _norm(token: str) -> str:
+    token = unicodedata.normalize("NFKD", token).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]", "", token)
+
+
+def align_to_script(words: list[Word], script_text: str) -> list[Word]:
+    """Keep Whisper's timings but the script's spelling (Whisper mishears names, accents, 'Olhe' -> 'Oi').
+
+    Tokens are matched with difflib; mismatched stretches get the script words spread evenly over
+    the time span Whisper heard there.
+    """
+    tokens = script_text.split()
+    if not tokens:
+        return words
+    matcher = difflib.SequenceMatcher(None, [_norm(w.text) for w in words], [_norm(t) for t in tokens], autojunk=False)
+    aligned: list[Word] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            aligned += [Word(words[i1 + k].start, words[i1 + k].end, tokens[j1 + k]) for k in range(i2 - i1)]
+            continue
+        if j1 == j2:  # Whisper hallucinated extra words: drop them
+            continue
+        if i1 < i2:
+            start, end = words[i1].start, words[i2 - 1].end
+        else:  # Whisper missed words: squeeze them into the gap between neighbours
+            start = words[i1 - 1].end if i1 > 0 else 0.0
+            end = words[i1].start if i1 < len(words) else start + 0.3 * (j2 - j1)
+            end = max(end, start + 0.12 * (j2 - j1))
+        step = (end - start) / (j2 - j1)
+        aligned += [Word(start + k * step, start + (k + 1) * step, tokens[j1 + k]) for k in range(j2 - j1)]
+    for prev, cur in zip(aligned, aligned[1:]):  # keep timings monotonic
+        if cur.start < prev.end:
+            cur.start = prev.end
+        if cur.end <= cur.start:
+            cur.end = cur.start + 0.05
+    matched = sum(b.size for b in matcher.get_matching_blocks())
+    log.info("subtitle alignment: %d/%d script words matched Whisper exactly", matched, len(tokens))
+    return aligned
 
 
 # --------------------------------------------------------------------------- ASS writer

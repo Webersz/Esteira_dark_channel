@@ -27,7 +27,7 @@ from src.engine.media_fetcher import fetch_scene_assets
 from src.engine.renderer import render_video
 from src.engine.schemas import VideoScript
 from src.engine.script_generator import generate_script
-from src.engine.subtitles_ass import build_ass, transcribe_words
+from src.engine.subtitles_ass import align_to_script, build_ass, transcribe_words
 
 log = logging.getLogger(__name__)
 settings = get_settings()
@@ -143,7 +143,7 @@ def run_pipeline(channel_id: str, force: bool = False, work_root: Path | None = 
     video_id = (db.create_video(channel_id, script.topic, script.title, script.model_dump(mode="json"), str(workdir))
                 if use_db else None)
     try:
-        words = transcribe_words(narration, channel.language, script.narration)
+        words = align_to_script(transcribe_words(narration, channel.language, script.narration), script.narration)
         subs = build_ass(words, channel.subtitle, workdir / "subs.ass", narration_dur + TAIL_SECONDS)
         assets = asyncio.run(fetch_scene_assets(script, channel, workdir))
         final, duration = render_video(script, assets, narration, narration_dur, words, subs, channel, workdir)

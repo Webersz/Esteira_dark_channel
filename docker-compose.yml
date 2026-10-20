@@ -8,6 +8,7 @@ x-app: &app
     - ./media_assets:/app/media_assets
     - ./output:/app/output
     - ./reports:/app/reports
+    - ./output_test:/app/output_test
     - models:/models
   depends_on:
     postgres:
