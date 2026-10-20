@@ -13,7 +13,7 @@ from src.config_loader import ChannelConfig
 
 log = logging.getLogger(__name__)
 
-TAIL_SECONDS = 0.6  # silence kept after the last word (video = narration + tail)
+TAIL_SECONDS = 0.15  # tiny gap after the last word: scene 16 must flow straight back into scene 1 (loop)
 MIN_TEMPO, MAX_TEMPO = 0.82, 1.30  # beyond this the voice sounds broken -> regenerate the script
 
 
@@ -69,8 +69,9 @@ def synthesize(text: str, channel: ChannelConfig, workdir: Path) -> tuple[Path, 
     asyncio.run(_edge_tts(text, voice.voice, voice.rate, raw_mp3))
     raw_duration, sample_rate = probe_audio(raw_mp3)
 
-    lo = channel.min_duration - TAIL_SECONDS + 0.3
-    hi = channel.max_duration - TAIL_SECONDS - 0.3
+    # Margins absorb the leading/trailing silence trim applied below (measured on the raw file here)
+    lo = channel.min_duration - TAIL_SECONDS + 0.8
+    hi = channel.max_duration - TAIL_SECONDS - 0.8
     tempo = voice.tempo
     if not lo <= raw_duration / tempo <= hi:
         tempo = raw_duration / (channel.target_duration - TAIL_SECONDS)
@@ -81,6 +82,9 @@ def synthesize(text: str, channel: ChannelConfig, workdir: Path) -> tuple[Path, 
     p = 2 ** (voice.pitch_semitones / 12.0)
     filters = [
         "silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.05",
+        # Trailing-silence trim for the seamless loop. Done as reverse -> trim start -> reverse because
+        # `silenceremove=stop_periods=-1` would also delete every natural pause in the middle of the speech.
+        "areverse,silenceremove=start_periods=1:start_duration=0.1:start_threshold=-45dB,areverse",
         f"asetrate={round(sample_rate * p)}",
         f"aresample={sample_rate}",
         *_atempo_chain(tempo / p),

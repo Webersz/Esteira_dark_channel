@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import difflib
 import logging
+import random
 import re
 import time
 
@@ -12,12 +13,25 @@ from google.genai import types
 
 from src.config_loader import ChannelConfig, get_settings
 from src.database import normalize_topic
-from src.engine.schemas import VideoScript
+from src.engine.schemas import CameraMove, TransitionSfx, VideoScript
 
 log = logging.getLogger(__name__)
 
 SIMILARITY_THRESHOLD = 0.78
 MAX_ATTEMPTS = 4
+TWIST_SCENE = 7  # 1-based, lands around the 25 s mark
+
+# Rotated per video (anti format fatigue). Each rule is injected for scene 1 only.
+HOOK_ARCHETYPES: dict[str, str] = {
+    "IN_MEDIA_RES": "Start at the exact millisecond of catastrophe, failure or peak emotional breakdown, with zero "
+                    "introductory context. Example: 'Faltavam exatos 4 segundos para a valvula explodir quando...'",
+    "MITO_QUEBRADO": "Open by contradicting a belief the audience holds, to trigger cognitive dissonance. "
+                     "Example: 'Se voce acha que fazer isso vai salvar sua vida, voce acabou de assinar sua sentenca...'",
+    "NUMERO_ESPECIFICO": "Open with a hyper-specific, bizarre financial or technical number. "
+                         "Example: 'Por causa de 42 milhoes de reais e uma linha de codigo esquecida as 3 da manha...'",
+    "CONFRONTO_DIRETO": "Address the viewer directly with an urgent command or physiological trigger. "
+                        "Example: 'Nao pisque pelos proximos 4 segundos e olhe para o canto dessa imagem...'",
+}
 
 _client: genai.Client | None = None
 
@@ -37,15 +51,18 @@ SYSTEM_INSTRUCTION = """You are the head writer of a top-performing faceless sho
 You write scripts engineered for maximum retention on YouTube Shorts and TikTok:
 - Scene 1 is a pattern-interrupt hook that creates an open loop in the first 2 seconds (no greetings, no "hoje vamos").
 - Every scene adds new information or tension; no filler, no repetition.
-- Re-hook around scenes 6 and 11 ("mas o pior ainda está por vir" style beats).
-- The last scene resolves the loop and its final sentence flows naturally back into scene 1 (seamless loop).
-- No calls like "se inscreva" until the very last scene, and keep it to one short clause if used.
+- Scene 7 (~25 s) is a mandatory retention reset: a sudden complication, betrayal or unexpected discovery
+  ("Mas o que ninguem sabia e que..."). Re-hook again around scene 11.
+- Scenes 16 and 1 form ONE continuous sentence (infinite loop): scene 16 delivers the climax/resolution in its
+  first 7 words and ends with an open connector phrase ("...e tudo isso so aconteceu porque no comeco...",
+  "...e o motivo real disso tudo e que...") WITHOUT a final period, so it flows grammatically into scene 1.
+- No "se inscreva" / "siga" calls anywhere: they break the loop.
 - Narration is plain spoken text: no emojis, no markdown, no brackets, no stage directions, numbers written as words when short.
 - Image prompts are in English, cinematic, vertical 9:16, describe a single clear focal subject, and never contain text.
 """
 
 
-def _build_prompt(channel: ChannelConfig, recent_topics: list[str], feedback: list[str]) -> str:
+def _build_prompt(channel: ChannelConfig, recent_topics: list[str], feedback: list[str], hook: str) -> str:
     per_scene = channel.target_words / channel.scenes
     mascot = (
         f"\nMASCOT (appears as a separate animated sprite in about half of the scenes): {channel.character_description}."
@@ -61,6 +78,11 @@ NICHE: {channel.niche}
 LANGUAGE OF NARRATION, TITLE, DESCRIPTION AND COMMENT: {channel.language}
 EDITORIAL GUIDELINES: {channel.prompt_guidelines}
 VISUAL STYLE (for image prompts): {channel.visual_style}{mascot}
+
+HOOK ARCHETYPE: {hook}
+SCENE 1 RULE (strict): {HOOK_ARCHETYPES[hook]}
+SCENE {TWIST_SCENE} RULE (strict): plot twist / pattern interrupt; set its sfx to "impact" and camera to "shake".
+SCENE {channel.scenes} RULE (strict): climax in the first 7 words, ends with an open connector that loops into scene 1, no final period.
 
 HARD REQUIREMENTS:
 - Exactly {channel.scenes} scenes.
@@ -89,6 +111,9 @@ def _sanitize(script: VideoScript) -> VideoScript:
         scene.narration = re.sub(r"\s+", " ", _CLEAN_RE.sub("", scene.narration)).strip()
         scene.image_prompt = scene.image_prompt.strip()
         scene.character_pose = scene.character_pose.strip()
+    if script.scenes:
+        # Loop: no falling "end of sentence" intonation on the last line
+        script.scenes[-1].narration = script.scenes[-1].narration.rstrip(" .!")
     script.hashtags = [h if h.startswith("#") else f"#{h}" for h in (h.strip().replace(" ", "") for h in script.hashtags) if h]
     script.tags = [t.strip().lstrip("#") for t in script.tags if t.strip()]
     return script
@@ -145,9 +170,10 @@ def generate_script(channel: ChannelConfig, recent_topics: list[str], extra_feed
     """Generate a validated 16-scene script. Retries with model-facing feedback on rule violations."""
     feedback = list(extra_feedback or [])
     last_problems: list[str] = []
+    hook = random.choice(list(HOOK_ARCHETYPES))
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            script = _sanitize(_call_gemini(_build_prompt(channel, recent_topics, feedback)))
+            script = _sanitize(_call_gemini(_build_prompt(channel, recent_topics, feedback, hook)))
         except ValueError as exc:  # pydantic ValidationError subclasses ValueError
             feedback = [f"Your JSON did not match the schema: {str(exc)[:400]}"]
             continue
@@ -155,7 +181,11 @@ def generate_script(channel: ChannelConfig, recent_topics: list[str], extra_feed
             script.scenes = script.scenes[: channel.scenes]  # cheap fix, then re-check word budget
         last_problems = validate_script(script, channel, recent_topics)
         if not last_problems:
-            log.info("[%s] script OK on attempt %d: %s (%d words)", channel.id, attempt, script.topic, script.word_count)
+            script.hook_archetype = hook
+            twist = script.scenes[TWIST_SCENE - 1]  # enforced regardless of what the model chose
+            twist.sfx, twist.camera = TransitionSfx.IMPACT, CameraMove.SHAKE
+            log.info("[%s] script OK on attempt %d: %s (%d words, hook %s)", channel.id, attempt, script.topic,
+                     script.word_count, hook)
             return script
         log.warning("[%s] script attempt %d rejected: %s", channel.id, attempt, last_problems)
         feedback = last_problems

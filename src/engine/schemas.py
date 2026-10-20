@@ -48,6 +48,7 @@ class Scene(BaseModel):
 
 
 class VideoScript(BaseModel):
+    hook_archetype: str = Field(description="Echo the HOOK ARCHETYPE name given in the prompt.")
     topic: str = Field(description="Short unique topic label (max 12 words) used for de-duplication.")
     title: str = Field(description="Curiosity-driven title in the channel language, max 70 characters, no hashtags.")
     description: str = Field(description="2-3 sentence description in the channel language for YouTube/TikTok.")

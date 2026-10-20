@@ -233,8 +233,9 @@ def _final_pass(base: Path, narration: Path, subs: Path, channel: ChannelConfig,
 
     graph.append(
         f"{''.join(mix)}amix=inputs={len(mix)}:duration=longest:dropout_transition=0:normalize=0,"
+        # No long fade-out: the last frame must cut straight back to 0.0 s (loop). 40 ms only avoids a click.
         f"apad=whole_dur={total:.3f},atrim=0:{total:.3f},alimiter=limit=0.95,"
-        f"afade=t=out:st={total - 1.0:.3f}:d=1.0[aout]"
+        f"afade=t=out:st={total - 0.04:.3f}:d=0.04[aout]"
     )
     run_ffmpeg([
         *args, "-filter_complex", ";".join(graph), "-map", "[vout]", "-map", "[aout]",

@@ -1,10 +1,8 @@
 """TikTok upload through TikTok Studio using a persistent Chromium profile per channel (optional proxy).
 
-One-time login per channel (headed browser; you log in by hand):
+One-time login per channel: `python auth_tiktok.py` (headed browser; you log in by hand).
 
-    python -m src.publishers.tiktok_playwright login nicho_1
-
-Besides the Chromium profile, the login also exports `storage_state.json` (cookies + localStorage).
+Besides the Chromium profile, the login exports `storage_state.json` (cookies + localStorage).
 Chromium profiles created on Windows/macOS are encrypted with OS keychains and won't decrypt inside
 the Linux container, so the container re-imports cookies from that portable JSON when needed.
 
@@ -15,14 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
-import sys
 import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 from playwright.sync_api import BrowserContext, Page, TimeoutError as PWTimeout, sync_playwright
 
-from src.config_loader import ChannelConfig, get_channel, get_settings
+from src.config_loader import ChannelConfig, get_settings
 
 log = logging.getLogger(__name__)
 
@@ -45,16 +42,27 @@ def _profile_dir(channel: ChannelConfig) -> Path:
 
 
 def _proxy(channel: ChannelConfig) -> dict | None:
-    if not channel.tiktok.proxy:
-        return None
-    parsed = urlparse(channel.tiktok.proxy)
-    proxy = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
-    if parsed.username:
-        proxy.update(username=parsed.username, password=parsed.password or "")
-    return proxy
+    """Per-channel `proxy` URL wins; otherwise TIKTOK_PROXY_SERVER/USER/PASS from .env; otherwise direct."""
+    if channel.tiktok.proxy:
+        parsed = urlparse(channel.tiktok.proxy)
+        proxy = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+        if parsed.username:
+            proxy.update(username=parsed.username, password=parsed.password or "")
+        return proxy
+    settings = get_settings()
+    if settings.tiktok_proxy_server:
+        proxy = {"server": settings.tiktok_proxy_server}
+        if settings.tiktok_proxy_user:
+            proxy.update(username=settings.tiktok_proxy_user, password=settings.tiktok_proxy_pass or "")
+        return proxy
+    return None
 
 
-def _launch(p, channel: ChannelConfig, headless: bool) -> BrowserContext:
+def storage_state_path(channel: ChannelConfig) -> Path:
+    return _profile_dir(channel) / "storage_state.json"
+
+
+def launch(p, channel: ChannelConfig, headless: bool) -> BrowserContext:
     return p.chromium.launch_persistent_context(
         user_data_dir=str(_profile_dir(channel)),
         headless=headless,
@@ -66,7 +74,7 @@ def _launch(p, channel: ChannelConfig, headless: bool) -> BrowserContext:
 
 
 def _ensure_cookies(context: BrowserContext, channel: ChannelConfig) -> None:
-    state_file = _profile_dir(channel) / "storage_state.json"
+    state_file = storage_state_path(channel)
     has_session = any(c["name"] == "sessionid" for c in context.cookies("https://www.tiktok.com"))
     if not has_session and state_file.exists():
         cookies = json.loads(state_file.read_text(encoding="utf-8")).get("cookies", [])
@@ -151,14 +159,14 @@ def _wait_upload_finished(page: Page) -> None:
 def upload(channel: ChannelConfig, video_path: Path, caption: str, debug_dir: Path | None = None) -> str:
     settings = get_settings()
     with sync_playwright() as p:
-        context = _launch(p, channel, settings.tiktok_headless)
+        context = launch(p, channel, settings.tiktok_headless)
         page = context.pages[0] if context.pages else context.new_page()
         try:
             _ensure_cookies(context, channel)
             page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=90_000)
             page.wait_for_timeout(4000)
             if "login" in page.url:
-                raise TikTokAuthError(f"Session expired. Run: python -m src.publishers.tiktok_playwright login {channel.id}")
+                raise TikTokAuthError(f"Session expired. Run: python auth_tiktok.py --channel {channel.id}")
 
             file_input = page.locator('input[type="file"]').first
             file_input.wait_for(state="attached", timeout=60_000)
@@ -192,25 +200,3 @@ def build_caption(script: dict) -> str:
     hashtags = " ".join(script.get("hashtags", []))
     return f"{script['title']} {script.get('pinned_comment', '')} {hashtags}".strip()
 
-
-# --------------------------------------------------------------------------- CLI
-
-
-def _login(channel_id: str) -> None:
-    channel = get_channel(channel_id)
-    with sync_playwright() as p:
-        context = _launch(p, channel, headless=False)
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto("https://www.tiktok.com/login", wait_until="domcontentloaded")
-        input(f"[{channel_id}] Log in to TikTok in the opened window, then press ENTER here... ")
-        state = _profile_dir(channel) / "storage_state.json"
-        context.storage_state(path=str(state))
-        context.close()
-        print(f"Saved session to {state}")
-
-
-if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "login":
-        _login(sys.argv[2])
-    else:
-        print("usage: python -m src.publishers.tiktok_playwright login <channel_id>")

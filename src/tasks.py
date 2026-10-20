@@ -1,19 +1,18 @@
 """Celery workers + Beat schedule.
 
 Queues:  render  -> produce_video (CPU heavy, concurrency 1)
-         publish -> publish_youtube / publish_tiktok (concurrency 1: browser profiles must not collide)
+         publish -> publish_youtube / publish_tiktok / weekly analytics (concurrency 1: browser profiles
+                    must not collide)
 
-Manual run (no Celery needed, great for testing a channel end to end):
-
-    python -m src.tasks run nicho_1 [--publish] [--force]
+For manual runs use `main_cli.py` (no Celery worker needed).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import shutil
-import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -23,9 +22,10 @@ from celery.schedules import crontab
 from src import database as db
 from src.alerts import send_alert
 from src.config_loader import get_channel, get_settings, load_channels
-from src.engine.audio_tts import AudioLengthError, synthesize
+from src.engine.audio_tts import TAIL_SECONDS, AudioLengthError, synthesize
 from src.engine.media_fetcher import fetch_scene_assets
 from src.engine.renderer import render_video
+from src.engine.schemas import VideoScript
 from src.engine.script_generator import generate_script
 from src.engine.subtitles_ass import build_ass, transcribe_words
 
@@ -47,6 +47,7 @@ celery_app.conf.update(
         "src.tasks.cleanup_outputs": {"queue": "render"},
         "src.tasks.publish_youtube": {"queue": "publish"},
         "src.tasks.publish_tiktok": {"queue": "publish"},
+        "src.tasks.run_weekly_analytics_report": {"queue": "publish"},
     },
 )
 
@@ -54,6 +55,10 @@ celery_app.conf.update(
 def _beat_schedule() -> dict:
     schedule = {
         "cleanup-outputs": {"task": "src.tasks.cleanup_outputs", "schedule": crontab(hour=4, minute=0)},
+        "weekly-analytics": {
+            "task": "src.tasks.run_weekly_analytics_report",
+            "schedule": crontab(hour=20, minute=0, day_of_week=0),  # Sunday 20:00
+        },
     }
     for channel in load_channels().values():
         if not channel.enabled:
@@ -75,26 +80,51 @@ celery_app.conf.beat_schedule = _beat_schedule()
 # --------------------------------------------------------------------------- pipeline
 
 
-def run_pipeline(channel_id: str, force: bool = False) -> int | None:
-    """Script -> TTS -> Whisper/ASS -> assets -> render. Returns the DB video id (None if skipped)."""
+@dataclass
+class PipelineResult:
+    video_id: int | None  # None when running without the database
+    workdir: Path
+    final: Path
+    duration: float
+    script: VideoScript
+
+
+INTERMEDIATES = ("assets", "clips", "base.mp4", "narration_raw.mp3", "concat.txt")
+
+
+def cleanup_workdir(workdir: Path) -> None:
+    """Free disk after publishing: keep final.mp4, script.json, subs.ass and narration.wav only."""
+    for name in INTERMEDIATES:
+        target = workdir / name
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        elif target.exists():
+            target.unlink(missing_ok=True)
+
+
+def run_pipeline(channel_id: str, force: bool = False, work_root: Path | None = None,
+                 use_db: bool = True) -> PipelineResult | None:
+    """Script -> TTS -> Whisper/ASS -> assets -> render. Returns None if skipped."""
     channel = get_channel(channel_id)
-    if not channel.enabled:
+    if not channel.enabled and not force:
         log.info("[%s] disabled, skipping", channel_id)
         return None
-    db.init_db()
-    if not force and db.produced_since(channel_id, hours=20):
-        log.info("[%s] already produced in the last 20h, skipping", channel_id)
-        return None
+    if use_db:
+        db.init_db()
+        if not force and db.produced_since(channel_id, hours=20):
+            log.info("[%s] already produced in the last 20h, skipping", channel_id)
+            return None
 
-    workdir = settings.work_dir / channel_id / datetime.now().strftime("%Y%m%d_%H%M%S")
+    root = work_root or settings.work_dir / channel_id
+    workdir = root / datetime.now().strftime("%Y%m%d_%H%M%S")
     workdir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
-    recent = db.get_recent_topics(channel_id)
+    recent = db.get_recent_topics(channel_id) if use_db else []
     feedback: list[str] = []
-    for attempt in range(3):
+    for _attempt in range(3):
         script = generate_script(channel, recent, feedback)
-        if db.topic_exists(channel_id, script.topic):
+        if use_db and db.topic_exists(channel_id, script.topic):
             feedback = [f"Topic '{script.topic}' already exists. Choose a completely different subject."]
             recent = [script.topic, *recent]
             continue
@@ -110,48 +140,39 @@ def run_pipeline(channel_id: str, force: bool = False) -> int | None:
         raise RuntimeError("Could not obtain a script with valid narration length")
 
     (workdir / "script.json").write_text(script.model_dump_json(indent=2), encoding="utf-8")
-    video_id = db.create_video(channel_id, script.topic, script.title, script.model_dump(mode="json"), str(workdir))
+    video_id = (db.create_video(channel_id, script.topic, script.title, script.model_dump(mode="json"), str(workdir))
+                if use_db else None)
     try:
         words = transcribe_words(narration, channel.language, script.narration)
-        total = narration_dur + 0.6
-        subs = build_ass(words, channel.subtitle, workdir / "subs.ass", total)
+        subs = build_ass(words, channel.subtitle, workdir / "subs.ass", narration_dur + TAIL_SECONDS)
         assets = asyncio.run(fetch_scene_assets(script, channel, workdir))
         final, duration = render_video(script, assets, narration, narration_dur, words, subs, channel, workdir)
     except Exception as exc:
-        db.update_video(video_id, status=db.VideoStatus.FAILED, error=str(exc)[:4000])
+        if video_id:
+            db.update_video(video_id, status=db.VideoStatus.FAILED, error=str(exc)[:4000])
         raise
-    db.update_video(video_id, status=db.VideoStatus.RENDERED, video_path=str(final), duration=duration)
-    send_alert(f"[{channel.name}] rendered '{script.title}' ({duration:.1f}s) in {(time.time() - t0) / 60:.1f} min",
-               "success")
-    return video_id
+    if video_id:
+        db.update_video(video_id, status=db.VideoStatus.RENDERED, video_path=str(final), duration=duration)
+    procedural = sum(a.procedural for a in assets)
+    send_alert(f"[{channel.name}] rendered '{script.title}' ({duration:.1f}s, hook {script.hook_archetype}"
+               f"{f', {procedural} procedural frames' if procedural else ''}) in {(time.time() - t0) / 60:.1f} min",
+               "warning" if procedural else "success")
+    return PipelineResult(video_id, workdir, final, duration, script)
 
 
-def dispatch_publish(video_id: int) -> None:
+# --------------------------------------------------------------------------- publishing (plain functions)
+
+
+def _after_publish(video_id: int) -> None:
     video = db.get_video(video_id)
     channel = get_channel(video.channel_id)
-    if channel.youtube.enabled:
-        publish_youtube.delay(video_id)
-    if channel.tiktok.enabled:
-        publish_tiktok.delay(video_id)
+    status = db.refresh_publish_status(video_id, channel.youtube.enabled, channel.tiktok.enabled)
+    if status == db.VideoStatus.PUBLISHED and video.work_dir:
+        cleanup_workdir(Path(video.work_dir))
 
 
-# --------------------------------------------------------------------------- tasks
-
-
-@celery_app.task(bind=True, max_retries=2, default_retry_delay=900, soft_time_limit=3300, time_limit=3600)
-def produce_video(self, channel_id: str, force: bool = False):
-    try:
-        video_id = run_pipeline(channel_id, force=force)
-    except Exception as exc:
-        send_alert(f"[{channel_id}] production failed (try {self.request.retries + 1}/3): {exc}", "error")
-        raise self.retry(exc=exc)
-    if video_id and not settings.dry_run:
-        dispatch_publish(video_id)
-    return video_id
-
-
-@celery_app.task(bind=True, max_retries=3, default_retry_delay=1200)
-def publish_youtube(self, video_id: int):
+def publish_to_youtube(video_id: int) -> str | None:
+    """Upload + first comment. Raises on transient errors; returns None on auth errors (alerted)."""
     from src.publishers import youtube_api
 
     video = db.get_video(video_id)
@@ -166,17 +187,14 @@ def publish_youtube(self, video_id: int):
         return None
     except Exception as exc:
         db.update_video(video_id, youtube_status="error", error=str(exc)[:4000])
-        if self.request.retries >= self.max_retries:
-            send_alert(f"[{channel.name}] YouTube upload failed for good: {exc}", "error")
-        raise self.retry(exc=exc)
+        raise
     db.update_video(video_id, youtube_status="published", youtube_id=yt_id)
-    db.refresh_publish_status(video_id, channel.youtube.enabled, channel.tiktok.enabled)
+    _after_publish(video_id)
     send_alert(f"[{channel.name}] YouTube: https://youtube.com/shorts/{yt_id}", "success")
     return yt_id
 
 
-@celery_app.task(bind=True, max_retries=2, default_retry_delay=1800)
-def publish_tiktok(self, video_id: int):
+def publish_to_tiktok(video_id: int) -> str | None:
     from src.publishers import tiktok_playwright
 
     video = db.get_video(video_id)
@@ -192,13 +210,80 @@ def publish_tiktok(self, video_id: int):
         return None
     except Exception as exc:
         db.update_video(video_id, tiktok_status="error", error=str(exc)[:4000])
-        if self.request.retries >= self.max_retries:
-            send_alert(f"[{channel.name}] TikTok upload failed for good: {exc}", "error")
-        raise self.retry(exc=exc)
+        raise
     db.update_video(video_id, tiktok_status=status)
-    db.refresh_publish_status(video_id, channel.youtube.enabled, channel.tiktok.enabled)
+    _after_publish(video_id)
     send_alert(f"[{channel.name}] TikTok posted", "success")
     return status
+
+
+def dispatch_publish(video_id: int) -> None:
+    video = db.get_video(video_id)
+    channel = get_channel(video.channel_id)
+    if channel.youtube.enabled:
+        publish_youtube.delay(video_id)
+    if channel.tiktok.enabled:
+        publish_tiktok.delay(video_id)
+
+
+def run_channel_now(channel_id: str, force: bool = True) -> PipelineResult | None:
+    """Synchronous end-to-end run (CLI): render -> YouTube -> TikTok -> cleanup -> alerts."""
+    result = run_pipeline(channel_id, force=force)
+    if result is None or result.video_id is None:
+        return result
+    channel = get_channel(channel_id)
+    for enabled, publisher, name in ((channel.youtube.enabled, publish_to_youtube, "YouTube"),
+                                     (channel.tiktok.enabled, publish_to_tiktok, "TikTok")):
+        if not enabled:
+            continue
+        try:
+            publisher(result.video_id)
+        except Exception as exc:
+            send_alert(f"[{channel.name}] {name} upload failed: {exc}", "error")
+    return result
+
+
+# --------------------------------------------------------------------------- celery tasks
+
+
+@celery_app.task(bind=True, max_retries=2, default_retry_delay=900, soft_time_limit=3300, time_limit=3600)
+def produce_video(self, channel_id: str, force: bool = False):
+    try:
+        result = run_pipeline(channel_id, force=force)
+    except Exception as exc:
+        send_alert(f"[{channel_id}] production failed (try {self.request.retries + 1}/3): {exc}", "error")
+        raise self.retry(exc=exc)
+    if result and result.video_id and not settings.dry_run:
+        dispatch_publish(result.video_id)
+    return result.video_id if result else None
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=1200)
+def publish_youtube(self, video_id: int):
+    try:
+        return publish_to_youtube(video_id)
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            send_alert(f"[video {video_id}] YouTube upload failed for good: {exc}", "error")
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(bind=True, max_retries=2, default_retry_delay=1800)
+def publish_tiktok(self, video_id: int):
+    try:
+        return publish_to_tiktok(video_id)
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            send_alert(f"[video {video_id}] TikTok upload failed for good: {exc}", "error")
+        raise self.retry(exc=exc)
+
+
+@celery_app.task
+def run_weekly_analytics_report():
+    from src.analytics_reporter import run_report
+
+    _markdown, path = run_report(send=True)
+    return str(path)
 
 
 @celery_app.task
@@ -212,20 +297,3 @@ def cleanup_outputs():
             removed += 1
     log.info("cleanup removed %d run dirs", removed)
     return removed
-
-
-# --------------------------------------------------------------------------- CLI
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    if len(sys.argv) >= 3 and sys.argv[1] == "run":
-        vid = run_pipeline(sys.argv[2], force="--force" in sys.argv)
-        print(f"video_id={vid}")
-        if vid and "--publish" in sys.argv:
-            ch = get_channel(sys.argv[2])
-            if ch.youtube.enabled:
-                publish_youtube.apply(args=(vid,))
-            if ch.tiktok.enabled:
-                publish_tiktok.apply(args=(vid,))
-    else:
-        print("usage: python -m src.tasks run <channel_id> [--publish] [--force]")

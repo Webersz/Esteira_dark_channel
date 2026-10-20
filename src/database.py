@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import unicodedata
 from contextlib import contextmanager
@@ -9,10 +10,12 @@ from datetime import datetime, timedelta
 from typing import Any, Iterator
 
 from sqlalchemy import JSON, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from src.config_loader import get_settings
+
+log = logging.getLogger(__name__)
 
 
 class Base(DeclarativeBase):
@@ -28,7 +31,7 @@ class VideoStatus:
 
 
 class Video(Base):
-    __tablename__ = "videos"
+    __tablename__ = "videos_history"
     __table_args__ = (UniqueConstraint("channel_id", "topic_key", name="uq_channel_topic"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -60,13 +63,24 @@ _SessionLocal: sessionmaker | None = None
 def get_engine():
     global _engine, _SessionLocal
     if _engine is None:
-        _engine = create_engine(get_settings().database_url, pool_pre_ping=True, pool_size=5, future=True)
+        _engine = create_engine(get_settings().database_url, pool_pre_ping=True, pool_size=5, future=True,
+                                connect_args={"connect_timeout": 5})
         _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False)
     return _engine
 
 
 def init_db() -> None:
     Base.metadata.create_all(get_engine())
+
+
+def db_available() -> bool:
+    """True if PostgreSQL is reachable (tables are created on the way). Used by local test renders."""
+    try:
+        init_db()
+        return True
+    except OperationalError as exc:
+        log.warning("PostgreSQL unreachable (%s) - running without history/de-duplication", str(exc).splitlines()[0])
+        return False
 
 
 @contextmanager

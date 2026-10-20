@@ -14,6 +14,8 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 CHANNELS_FILE = BASE_DIR / "config" / "channels_config.json"
+REPORTS_DIR = BASE_DIR / "reports"
+OUTPUT_TEST_DIR = BASE_DIR / "output_test"
 
 
 def _bool(name: str, default: bool = False) -> bool:
@@ -45,6 +47,9 @@ class Settings(BaseModel):
 
     youtube_privacy: Literal["public", "unlisted", "private"] = "public"
     tiktok_headless: bool = True
+    tiktok_proxy_server: str | None = None  # global fallback when a channel has no "proxy"
+    tiktok_proxy_user: str | None = None
+    tiktok_proxy_pass: str | None = None
     dry_run: bool = False
     keep_days: int = 3
 
@@ -73,6 +78,9 @@ def get_settings() -> Settings:
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
         youtube_privacy=os.getenv("YOUTUBE_PRIVACY", "public"),
         tiktok_headless=_bool("TIKTOK_HEADLESS", True),
+        tiktok_proxy_server=os.getenv("TIKTOK_PROXY_SERVER") or None,
+        tiktok_proxy_user=os.getenv("TIKTOK_PROXY_USER") or None,
+        tiktok_proxy_pass=os.getenv("TIKTOK_PROXY_PASS") or None,
         dry_run=_bool("DRY_RUN", False),
         keep_days=int(os.getenv("KEEP_DAYS", "3")),
         work_dir=_path("WORK_DIR", BASE_DIR / "output"),
