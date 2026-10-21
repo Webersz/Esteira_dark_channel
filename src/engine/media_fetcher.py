@@ -9,15 +9,17 @@ import json
 import logging
 import random
 import subprocess
+import types
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
 import aiohttp
-from PIL import Image
+from PIL import Image, ImageChops, ImageFilter
 
 from src.config_loader import ChannelConfig, get_settings
+from src.engine import mascot
 from src.engine.schemas import VideoScript
 
 log = logging.getLogger(__name__)
@@ -85,8 +87,9 @@ async def _anon_slot():
     """Serialize anonymous Pollinations requests and space them ANON_INTERVAL_S after the previous one
     *finished* (the free-tier window is counted from generation end). No-op with POLLINATIONS_TOKEN."""
     global _throttle_lock, _last_request
+    slot = types.SimpleNamespace(penalize=False)  # caller sets True on failure -> one extra window of rest
     if get_settings().pollinations_token:
-        yield
+        yield slot
         return
     if _throttle_lock is None:
         _throttle_lock = asyncio.Lock()
@@ -96,9 +99,9 @@ async def _anon_slot():
         if wait > 0:
             await asyncio.sleep(wait)
         try:
-            yield
+            yield slot
         finally:
-            _last_request = loop.time()
+            _last_request = loop.time() + (ANON_INTERVAL_S if slot.penalize else 0.0)
 
 
 async def _pollinations_image(session, sem, prompt: str, seed: int, dest: Path, w: int = 1080, h: int = 1920) -> bool:
@@ -110,8 +113,10 @@ async def _pollinations_image(session, sem, prompt: str, seed: int, dest: Path, 
     plan += [("turbo", seed + random.randint(1, 9999), 0) for _ in range(TIER2_ATTEMPTS)]
     for attempt, (model, current_seed, wait) in enumerate(plan, start=1):
         url = POLLINATIONS_URL.format(prompt=encoded, w=w, h=h, seed=current_seed, model=model)
-        async with _anon_slot():
+        async with _anon_slot() as slot:
             img = _valid_image(await _fetch_bytes(session, url, sem, headers=headers, retries=1))
+            # After a timeout the server keeps generating and counts it against the free window
+            slot.penalize = img is None
         if img is not None:
             img.save(dest, "JPEG", quality=94)
             if attempt > 1:
@@ -173,16 +178,26 @@ def _cutout_sync(src: Path, dest: Path) -> bool:
         _rembg_session = new_session("isnet-general-use")
     img = Image.open(src).convert("RGB")
     cut = remove(img, session=_rembg_session, post_process_mask=True)
-    alpha = cut.getchannel("A")
+    coverage = sum(1 for a in cut.getchannel("A").getdata() if a > 20) / (img.width * img.height)
+    if not 0.04 <= coverage <= 0.85:  # empty or failed segmentation
+        return False
+    return save_clean_cutout(cut, dest)
+
+
+def save_clean_cutout(rgba: Image.Image, dest: Path, pad: int = 8) -> bool:
+    """Drop stray specks left by segmentation, then crop tight to the character and save as PNG."""
+    alpha = rgba.getchannel("A")
+    mask = alpha.point(lambda a: 255 if a > 20 else 0)
+    # Opening erases islands < ~11 px; the generous dilation then keeps thin parts attached to the body
+    body = mask.filter(ImageFilter.MinFilter(11)).filter(ImageFilter.MaxFilter(11)).filter(ImageFilter.MaxFilter(31))
+    alpha = ImageChops.multiply(alpha, body)
+    rgba = rgba.copy()
+    rgba.putalpha(alpha)
     bbox = alpha.point(lambda a: 255 if a > 20 else 0).getbbox()
     if not bbox:
         return False
-    coverage = sum(1 for a in alpha.getdata() if a > 20) / (img.width * img.height)
-    if not 0.04 <= coverage <= 0.85:  # empty or failed segmentation
-        return False
-    pad = 8
-    bbox = (max(0, bbox[0] - pad), max(0, bbox[1] - pad), min(img.width, bbox[2] + pad), min(img.height, bbox[3] + pad))
-    cut.crop(bbox).save(dest, "PNG")
+    bbox = (max(0, bbox[0] - pad), max(0, bbox[1] - pad), min(rgba.width, bbox[2] + pad), min(rgba.height, bbox[3] + pad))
+    rgba.crop(bbox).save(dest, "PNG")
     return True
 
 
@@ -198,8 +213,8 @@ async def _cutout(src: Path, dest: Path) -> bool:
 
 
 async def _fetch_scene(i, scene, channel: ChannelConfig, assets_dir: Path, session, sem, base_seed: int,
-                       used_ids: set[int], rng: random.Random) -> SceneAsset:
-    use_sprite = channel.is_character_channel and bool(scene.character_pose)
+                       used_ids: set[int], rng: random.Random, sprites: dict[str, Path]) -> SceneAsset:
+    use_sprite = bool(sprites) and bool(scene.character_pose)
 
     # 1) Optional B-roll for hybrid channels
     if channel.use_broll and not use_sprite and i % max(1, channel.broll_every) == channel.broll_every - 1:
@@ -214,27 +229,50 @@ async def _fetch_scene(i, scene, channel: ChannelConfig, assets_dir: Path, sessi
     bg_prompt = f"{bg_prompt}, {channel.visual_style}, vertical 9:16 composition, {NEGATIVE_HINT}"
     bg = assets_dir / f"scene_{i:02d}.jpg"
 
-    tasks = [_pollinations_image(session, sem, bg_prompt, base_seed + i, bg)]
-    sprite_raw = assets_dir / f"sprite_{i:02d}_raw.jpg"
-    if use_sprite:
-        sprite_prompt = (
-            f"{channel.character_description}, {scene.character_pose}, full body, centered, single character, "
-            f"isolated on plain pure white background, soft studio lighting, 3D render, {NEGATIVE_HINT}"
-        )
-        # Same seed for every sprite of the channel keeps the mascot visually consistent
-        tasks.append(_pollinations_image(session, sem, sprite_prompt, channel.character_seed, sprite_raw, 1024, 1536))
-    results = await asyncio.gather(*tasks)
-    procedural = not results[0]
+    procedural = not await _pollinations_image(session, sem, bg_prompt, base_seed + i, bg)
     if procedural:
         log.warning("[%s] scene %d: Pollinations tiers 1+2 failed -> tier 3 procedural frame", channel.id, i)
         await asyncio.to_thread(_procedural_image_sync, bg, base_seed + i)
 
-    sprite = None
-    if use_sprite and results[1]:
-        sprite_png = assets_dir / f"sprite_{i:02d}.png"
-        if await _cutout(sprite_raw, sprite_png):
-            sprite = sprite_png
+    # 3) Mascot from the channel's fixed library (same character in every video)
+    sprite = mascot.pick_sprite(sprites, scene.character_pose, i) if use_sprite else None
     return SceneAsset(i, "image", bg, sprite, procedural)
+
+
+# --------------------------------------------------------------------------- mascot library
+
+
+async def ensure_mascot_library(channel: ChannelConfig, session, sem, force: bool = False) -> None:
+    """Generate media_assets/characters/<channel>/<pose>.png once (skipped if any PNG already exists)."""
+    folder = mascot.library_dir(channel)
+    if mascot.source_pngs(channel) and not force:
+        return
+    raw_dir = folder / "_raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    log.info("[%s] building mascot library (%d poses) in %s", channel.id, len(mascot.POSES), folder)
+    for pose, description in mascot.POSES.items():
+        prompt = (
+            f"{channel.character_description}, {description}, full body, centered, single character, "
+            f"isolated on plain pure white background, soft studio lighting, 3D render, {NEGATIVE_HINT}"
+        )
+        raw = raw_dir / f"{pose}.jpg"
+        # Same seed + same description for every pose maximizes resemblance between poses
+        if await _pollinations_image(session, sem, prompt, channel.character_seed, raw, 1024, 1536) \
+                and await _cutout(raw, folder / f"{pose}.png"):
+            log.info("[%s] mascot pose '%s' ready", channel.id, pose)
+        else:
+            log.warning("[%s] mascot pose '%s' failed, skipped", channel.id, pose)
+    sprites = await asyncio.to_thread(mascot.prepared_sprites, channel)
+    preview = mascot.save_preview(channel, sprites)
+    log.info("[%s] mascot library: %d poses, preview %s", channel.id, len(sprites), preview)
+
+
+async def build_mascot_library(channel: ChannelConfig, force: bool = False) -> None:
+    """Standalone entry point (CLI)."""
+    global _throttle_lock
+    _throttle_lock = None
+    async with aiohttp.ClientSession(headers={"User-Agent": "dark-factory-os/1.0"}) as session:
+        await ensure_mascot_library(channel, session, asyncio.Semaphore(1), force=force)
 
 
 async def fetch_scene_assets(script: VideoScript, channel: ChannelConfig, workdir: Path) -> list[SceneAsset]:
@@ -244,7 +282,7 @@ async def fetch_scene_assets(script: VideoScript, channel: ChannelConfig, workdi
     _throttle_lock = None  # asyncio.Lock is bound to the event loop; each asyncio.run() gets a fresh one
     base_seed = int(hashlib.md5(script.topic.encode()).hexdigest()[:7], 16)
     if not get_settings().pollinations_token:
-        n = len(script.scenes) + sum(bool(s.character_pose) for s in script.scenes) * channel.is_character_channel
+        n = len(script.scenes)
         log.info("[%s] no POLLINATIONS_TOKEN: anonymous tier paced at 1 image/%.0fs (~%.0f min for %d images)",
                  channel.id, ANON_INTERVAL_S, n * ANON_INTERVAL_S / 60, n)
     rng = random.Random(base_seed)
@@ -252,8 +290,14 @@ async def fetch_scene_assets(script: VideoScript, channel: ChannelConfig, workdi
     used_ids: set[int] = set()
     connector = aiohttp.TCPConnector(limit=8)
     async with aiohttp.ClientSession(connector=connector, headers={"User-Agent": "dark-factory-os/1.0"}) as session:
+        sprites: dict[str, Path] = {}
+        if channel.is_character_channel:
+            await ensure_mascot_library(channel, session, sem)  # one-time, ~5 min on the free tier
+            sprites = await asyncio.to_thread(mascot.prepared_sprites, channel)
+            if not sprites:
+                log.error("[%s] mascot library is empty: rendering without the character", channel.id)
         assets = await asyncio.gather(*(
-            _fetch_scene(i, scene, channel, assets_dir, session, sem, base_seed, used_ids, rng)
+            _fetch_scene(i, scene, channel, assets_dir, session, sem, base_seed, used_ids, rng, sprites)
             for i, scene in enumerate(script.scenes)
         ))
 

@@ -13,12 +13,14 @@ from google.genai import types
 
 from src.config_loader import ChannelConfig, get_settings
 from src.database import normalize_topic
+from src.engine import mascot
 from src.engine.schemas import CameraMove, TransitionSfx, VideoScript
 
 log = logging.getLogger(__name__)
 
 SIMILARITY_THRESHOLD = 0.78
-MAX_ATTEMPTS = 4
+MAX_ATTEMPTS = 4  # content-rule retries
+GEMINI_ATTEMPTS = 7  # API-error retries per call
 TWIST_SCENE = 7  # 1-based, lands around the 25 s mark
 
 # Rotated per video (anti format fatigue). Each rule is injected for scene 1 only.
@@ -66,10 +68,12 @@ You write scripts engineered for maximum retention on YouTube Shorts and TikTok:
 
 def _build_prompt(channel: ChannelConfig, recent_topics: list[str], feedback: list[str], hook: str) -> str:
     per_scene = channel.target_words / channel.scenes
-    mascot = (
+    mascot_rules = (
         f"\nMASCOT (appears as a separate animated sprite in about half of the scenes): {channel.character_description}."
-        "\nFill `character_pose` for scenes where the mascot reacts/explains; the `image_prompt` of those scenes must "
-        "describe ONLY the background environment (no characters), because the mascot is composited on top."
+        "\nFill `character_pose` for scenes where the mascot reacts/explains, using EXACTLY one of these pose keys: "
+        f"{', '.join(mascot.pose_names(channel))}. Pick the key matching the emotion of the line. The `image_prompt` "
+        "of those scenes must describe ONLY the background environment (no characters), because the mascot is "
+        "composited on top."
         if channel.is_character_channel
         else "\nThis channel has NO mascot: `character_pose` must always be an empty string."
     )
@@ -79,7 +83,7 @@ def _build_prompt(channel: ChannelConfig, recent_topics: list[str], feedback: li
 NICHE: {channel.niche}
 LANGUAGE OF NARRATION, TITLE, DESCRIPTION AND COMMENT: {channel.language}
 EDITORIAL GUIDELINES: {channel.prompt_guidelines}
-VISUAL STYLE (for image prompts): {channel.visual_style}{mascot}
+VISUAL STYLE (for image prompts): {channel.visual_style}{mascot_rules}
 
 HOOK ARCHETYPE: {hook}
 SCENE 1 RULE (strict): {HOOK_ARCHETYPES[hook]}
@@ -149,7 +153,7 @@ def _call_gemini(prompt: str) -> VideoScript:
         top_p=0.95,
         max_output_tokens=8192,
     )
-    for attempt in range(5):
+    for attempt in range(GEMINI_ATTEMPTS):
         try:
             response = _get_client().models.generate_content(
                 model=settings.gemini_model, contents=prompt, config=config
@@ -160,9 +164,10 @@ def _call_gemini(prompt: str) -> VideoScript:
             return VideoScript.model_validate_json(response.text or "")
         except genai_errors.APIError as exc:
             retryable = getattr(exc, "code", None) in {429, 500, 502, 503, 504}
-            if not retryable or attempt == 4:
+            if not retryable or attempt == GEMINI_ATTEMPTS - 1:
                 raise ScriptGenerationError(f"Gemini API error: {exc}") from exc
-            wait = 15 * (2**attempt)
+            # 15, 30, 60, 120, 240, 240 s: rides out multi-minute "high demand" 503 spikes (~12 min total)
+            wait = min(240, 15 * (2**attempt))
             log.warning("Gemini %s, retrying in %ss", getattr(exc, "code", "?"), wait)
             time.sleep(wait)
     raise ScriptGenerationError("unreachable")

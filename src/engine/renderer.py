@@ -144,7 +144,8 @@ def _render_scene(idx: int, asset: SceneAsset, scene: Scene, frames: int, channe
         y = "H-h-150+14*sin(2*PI*t/1.3)+760*pow(max(0,1-t/0.32),3)"  # cubic ease-out pop-in from below
         graph = (
             f"{src},gblur=sigma=2.5[bg];"  # depth of field: background slightly out of focus
-            f"[1:v]format=rgba,scale={sw}:{sh},"
+            # Library sprites repeat across scenes: mirror them on the left side so they read as new shots
+            f"[1:v]format=rgba,scale={sw}:{sh}{',hflip' if side < 0 else ''},"
             f"rotate='0.035*sin(2*PI*t/2.6)':c=none:ow='rotw(0.06)':oh='roth(0.06)',split[spr][sh];"
             f"[sh]colorchannelmixer=rr=0:gg=0:bb=0:aa=0.5,gblur=sigma=16[shadow];"
             f"[bg][shadow]overlay=x='{x}+22':y='{y}+34'[b1];"

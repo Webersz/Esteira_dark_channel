@@ -8,3 +8,5 @@ __pycache__/
 output_test/
 reports/
 .venv/
+media_assets/characters/*/_cache/
+media_assets/characters/*/_raw/

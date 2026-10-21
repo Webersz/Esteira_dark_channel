@@ -35,9 +35,8 @@ class Scene(BaseModel):
         "Describe subject, setting, lighting and camera angle. Never ask for text, letters or logos."
     )
     character_pose: str = Field(
-        description="English description of the mascot character's action/expression in this scene "
-        "(e.g. 'pointing up excitedly, mouth open'). Empty string if the mascot should not appear "
-        "or the channel has no mascot."
+        description="Mascot pose key for this scene (one of the keys listed in the prompt, e.g. 'pointing'). "
+        "Empty string if the mascot should not appear or the channel has no mascot."
     )
     broll_query: str = Field(description="2-3 English keywords to search stock footage for this scene.")
     camera: CameraMove = Field(description="Camera movement that best fits the emotion of the scene.")

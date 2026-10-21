@@ -6,6 +6,7 @@
     python main_cli.py --test-render nicho_1      # full 16-scene video into ./output_test/nicho_1/, no upload
     python main_cli.py --run-channel nicho_1      # full pipeline incl. YouTube + TikTok + cleanup + alerts
     python main_cli.py --report-analytics         # 7-day table to stdout + Telegram
+    python main_cli.py --init-mascots [--channel nicho_2] [--force]   # fixed mascot pose library
 """
 from __future__ import annotations
 
@@ -23,7 +24,11 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--test-render", metavar="CHANNEL_ID", help="render one video locally, no upload")
     group.add_argument("--run-channel", metavar="CHANNEL_ID", help="full production + publishing pipeline")
     group.add_argument("--report-analytics", action="store_true", help="7-day analytics report (stdout + Telegram)")
-    parser.add_argument("--force", action="store_true", help="auth: redo existing; run: ignore the 20h guard")
+    group.add_argument("--init-mascots", action="store_true",
+                       help="generate the fixed mascot pose library for 3D character channels")
+    parser.add_argument("--channel", help="--init-mascots: only this channel id")
+    parser.add_argument("--force", action="store_true",
+                        help="auth: redo existing; run: ignore the 20h guard; mascots: regenerate the library")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -71,6 +76,23 @@ def main(argv: list[str] | None = None) -> int:
         markdown, path = run_report(send=True)
         print(markdown)
         print(f"\nSaved to {path}")
+
+    elif args.init_mascots:
+        import asyncio
+
+        from src.config_loader import load_channels
+        from src.engine import mascot
+        from src.engine.media_fetcher import build_mascot_library
+
+        channels = [c for c in load_channels().values()
+                    if c.is_character_channel and (not args.channel or c.id == args.channel)]
+        if not channels:
+            print("No 3D character channel matches (needs style=3d_character and use_rembg=true).")
+            return 1
+        for channel in channels:
+            asyncio.run(build_mascot_library(channel, force=args.force))
+            print(f"[{channel.id}] poses: {', '.join(mascot.pose_names(channel))}"
+                  f"\n  review: {mascot.library_dir(channel) / '_preview.png'}")
     return 0
 
 
