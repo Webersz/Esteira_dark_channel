@@ -95,3 +95,5 @@ Gemini ficou ~30 min respondendo 503 "high demand").
    (B-roll), `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` (alertas).
 4. Começar com `DRY_RUN=true` e revisar os vídeos antes de liberar a publicação.
 5. Primeiro teste de publicação: `python main_cli.py --run-channel nicho_1`.
+
+> Contexto completo (histórico, decisões, lições e próximos passos): [CONTEXT.md](CONTEXT.md)
