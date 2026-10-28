@@ -34,7 +34,8 @@ def _list(name: str) -> list[str]:
 
 # Tried in order; a model that 404s for a key is skipped instantly. Check what your key sees with:
 #   python -c "from google import genai; c = genai.Client(api_key='KEY'); print([m.name for m in c.models.list()])"
-DEFAULT_GEMINI_MODELS = ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+DEFAULT_GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+                         "gemini-3-flash-preview", "gemini-3.5-flash-lite"]
 
 
 def _gemini_keys() -> list[str]:
