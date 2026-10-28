@@ -1,8 +1,8 @@
 """Operational CLI for dark-factory-os.
 
     python main_cli.py --init-assets              # synth SFX/BGM/overlay + create PostgreSQL tables
-    python main_cli.py --auth-youtube             # OAuth for channels missing a YouTube token
-    python main_cli.py --auth-tiktok              # log in to TikTok profiles missing a session
+    python main_cli.py --auth-youtube [--channel nicho_1] [--force]   # OAuth for channels missing a YouTube token
+    python main_cli.py --auth-tiktok [--channel nicho_1] [--force]    # log in to TikTok profiles missing a session
     python main_cli.py --test-render nicho_1      # full 16-scene video into ./output_test/nicho_1/, no upload
     python main_cli.py --run-channel nicho_1      # full pipeline incl. YouTube + TikTok + cleanup + alerts
     python main_cli.py --report-analytics         # 7-day table to stdout + Telegram
@@ -13,6 +13,10 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+
+
+def _auth_args(args: argparse.Namespace) -> list[str]:
+    return (["--force"] if args.force else []) + (["--channel", args.channel] if args.channel else [])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -26,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--report-analytics", action="store_true", help="7-day analytics report (stdout + Telegram)")
     group.add_argument("--init-mascots", action="store_true",
                        help="generate the fixed mascot pose library for 3D character channels")
-    parser.add_argument("--channel", help="--init-mascots: only this channel id")
+    parser.add_argument("--channel", help="--auth-youtube/--auth-tiktok/--init-mascots: only this channel id")
     parser.add_argument("--force", action="store_true",
                         help="auth: redo existing; run: ignore the 20h guard; mascots: regenerate the library")
     args = parser.parse_args(argv)
@@ -44,12 +48,12 @@ def main(argv: list[str] | None = None) -> int:
     elif args.auth_youtube:
         import auth_youtube
 
-        auth_youtube.main(["--force"] if args.force else [])
+        auth_youtube.main(_auth_args(args))
 
     elif args.auth_tiktok:
         import auth_tiktok
 
-        auth_tiktok.main(["--force"] if args.force else [])
+        auth_tiktok.main(_auth_args(args))
 
     elif args.test_render:
         from src import database as db

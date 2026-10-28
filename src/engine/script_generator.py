@@ -1,17 +1,24 @@
-"""Gemini 2.5 Flash script generation (google-genai SDK, Structured Outputs) with topic de-duplication."""
+"""Script generation with topic de-duplication.
+
+Primary engine: Gemini (google-genai SDK, Structured Outputs), cascading models x keys and skipping
+404/429/5xx instantly. If all of them fail, free OpenAI-compatible fallbacks (Groq / GitHub Models /
+OpenRouter) are tried, validated against the same `VideoScript` schema.
+"""
 from __future__ import annotations
 
 import difflib
+import json
 import logging
 import random
 import re
 import time
 
+import requests
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
-from src.config_loader import ChannelConfig, get_settings
+from src.config_loader import ChannelConfig, FallbackLLM, get_settings
 from src.database import normalize_topic
 from src.engine import mascot
 from src.engine.schemas import CameraMove, TransitionSfx, VideoScript
@@ -20,7 +27,11 @@ log = logging.getLogger(__name__)
 
 SIMILARITY_THRESHOLD = 0.78
 MAX_ATTEMPTS = 4  # content-rule retries
-GEMINI_ATTEMPTS = 7  # API-error retries per call
+CASCADE_ROUNDS = 3  # full passes over Gemini models x keys + fallbacks
+ROUND_WAITS = (60, 180)  # sleep between rounds (rides out short "high demand" spikes)
+SKIP_CODES = {400, 429, 500, 502, 503, 504}  # try the next key/model right away (400: e.g. no response_schema)
+UNAVAILABLE_CODES = {403, 404}  # model not enabled for this key: never retried in this process
+FALLBACK_TIMEOUT = 120
 TWIST_SCENE = 7  # 1-based, lands around the 25 s mark
 
 # Rotated per video (anti format fatigue). Each rule is injected for scene 1 only.
@@ -35,18 +46,18 @@ HOOK_ARCHETYPES: dict[str, str] = {
                         "Example: 'Não pisque pelos próximos 4 segundos e olhe para o canto dessa imagem...'",
 }
 
-_client: genai.Client | None = None
+_clients: dict[str, genai.Client] = {}
+_dead_pairs: set[tuple[str, str]] = set()  # (model, key) that answered 403/404
 
 
 class ScriptGenerationError(Exception):
     pass
 
 
-def _get_client() -> genai.Client:
-    global _client
-    if _client is None:
-        _client = genai.Client(api_key=get_settings().gemini_api_key)
-    return _client
+def _get_client(api_key: str) -> genai.Client:
+    if api_key not in _clients:
+        _clients[api_key] = genai.Client(api_key=api_key)
+    return _clients[api_key]
 
 
 SYSTEM_INSTRUCTION = """You are the head writer of a top-performing faceless short-form video channel.
@@ -143,8 +154,7 @@ def validate_script(script: VideoScript, channel: ChannelConfig, recent_topics: 
     return problems
 
 
-def _call_gemini(prompt: str) -> VideoScript:
-    settings = get_settings()
+def _gemini_once(model: str, api_key: str, prompt: str) -> VideoScript:
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_INSTRUCTION,
         response_mime_type="application/json",
@@ -153,24 +163,85 @@ def _call_gemini(prompt: str) -> VideoScript:
         top_p=0.95,
         max_output_tokens=8192,
     )
-    for attempt in range(GEMINI_ATTEMPTS):
-        try:
-            response = _get_client().models.generate_content(
-                model=settings.gemini_model, contents=prompt, config=config
-            )
-            if isinstance(response.parsed, VideoScript):
-                return response.parsed
-            # Fallback: parse raw JSON text (gives a precise error if malformed)
-            return VideoScript.model_validate_json(response.text or "")
-        except genai_errors.APIError as exc:
-            retryable = getattr(exc, "code", None) in {429, 500, 502, 503, 504}
-            if not retryable or attempt == GEMINI_ATTEMPTS - 1:
-                raise ScriptGenerationError(f"Gemini API error: {exc}") from exc
-            # 15, 30, 60, 120, 240, 240 s: rides out multi-minute "high demand" 503 spikes (~12 min total)
-            wait = min(240, 15 * (2**attempt))
-            log.warning("Gemini %s, retrying in %ss", getattr(exc, "code", "?"), wait)
+    response = _get_client(api_key).models.generate_content(model=model, contents=prompt, config=config)
+    if isinstance(response.parsed, VideoScript):
+        return response.parsed
+    # Fallback: parse raw JSON text (gives a precise error if malformed)
+    return VideoScript.model_validate_json(response.text or "")
+
+
+def _strip_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", text)
+    return text
+
+
+def _fallback_once(llm: FallbackLLM, prompt: str) -> VideoScript:
+    schema = json.dumps(VideoScript.model_json_schema(), ensure_ascii=False)
+    system = (
+        f"{SYSTEM_INSTRUCTION}\nReply ONLY with one valid JSON object that strictly follows this JSON Schema, "
+        f"with no markdown fences and no extra text:\n{schema}"
+    )
+    response = requests.post(
+        llm.url,
+        headers={"Authorization": f"Bearer {llm.api_key}", "Content-Type": "application/json"},
+        json={
+            "model": llm.model,
+            "temperature": 1.0,
+            "max_tokens": 8192,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        },
+        timeout=FALLBACK_TIMEOUT,
+    )
+    response.raise_for_status()
+    content = response.json()["choices"][0]["message"]["content"] or ""
+    return VideoScript.model_validate_json(_strip_fences(content))
+
+
+def _call_llm(prompt: str) -> VideoScript:
+    """Gemini models x keys, then free fallbacks; repeats the whole cascade CASCADE_ROUNDS times.
+
+    Schema violations (pydantic ValidationError, a ValueError) propagate so `generate_script` can feed
+    them back to the model.
+    """
+    settings = get_settings()
+    keys, models, fallbacks = settings.gemini_api_keys, settings.gemini_models, settings.fallback_llms
+    if not keys and not fallbacks:
+        raise ScriptGenerationError("No LLM configured: set GEMINI_API_KEYS (or GEMINI_API_KEY) or a fallback key.")
+    errors: list[str] = []
+    for round_no in range(CASCADE_ROUNDS):
+        for model in models:
+            for idx, key in enumerate(keys, start=1):
+                if (model, key) in _dead_pairs:
+                    continue
+                try:
+                    script = _gemini_once(model, key, prompt)
+                    log.info("Script via Gemini %s (key #%d)", model, idx)
+                    return script
+                except genai_errors.APIError as exc:
+                    code = getattr(exc, "code", None)
+                    errors.append(f"gemini {model} key#{idx}: HTTP {code}")
+                    if code in UNAVAILABLE_CODES:
+                        _dead_pairs.add((model, key))
+                    elif code not in SKIP_CODES:
+                        raise ScriptGenerationError(f"Gemini API error: {exc}") from exc
+                    log.warning("Gemini %s (key #%d) HTTP %s, trying next", model, idx, code)
+        for llm in fallbacks:
+            try:
+                script = _fallback_once(llm, prompt)
+                log.info("Script via fallback %s (%s)", llm.name, llm.model)
+                return script
+            except (requests.RequestException, KeyError, IndexError, TypeError) as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                errors.append(f"{llm.name}: {status or type(exc).__name__}")
+                log.warning("Fallback %s failed (%s), trying next", llm.name, status or exc)
+        if round_no < CASCADE_ROUNDS - 1:
+            wait = ROUND_WAITS[min(round_no, len(ROUND_WAITS) - 1)]
+            log.warning("Every LLM failed (round %d/%d), retrying in %ss", round_no + 1, CASCADE_ROUNDS, wait)
             time.sleep(wait)
-    raise ScriptGenerationError("unreachable")
+    raise ScriptGenerationError(f"All LLMs failed: {'; '.join(errors[-12:])}")
 
 
 def generate_script(channel: ChannelConfig, recent_topics: list[str], extra_feedback: list[str] | None = None) -> VideoScript:
@@ -180,7 +251,7 @@ def generate_script(channel: ChannelConfig, recent_topics: list[str], extra_feed
     hook = random.choice(list(HOOK_ARCHETYPES))
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            script = _sanitize(_call_gemini(_build_prompt(channel, recent_topics, feedback, hook)))
+            script = _sanitize(_call_llm(_build_prompt(channel, recent_topics, feedback, hook)))
         except ValueError as exc:  # pydantic ValidationError subclasses ValueError
             feedback = [f"Your JSON did not match the schema: {str(exc)[:400]}"]
             continue

@@ -160,7 +160,9 @@ Celery Beat ──► produce_video (fila render, concorrência 1)
    Mesmo dentro da biblioteca, algumas poses saem diferentes: precisa de curadoria humana.
 5. **O Gemini 2.5 Flash tem picos de 503 "high demand"** de 15–30 min, mesmo respondendo a
    chamadas pequenas. Os outros modelos (Flash-Lite e Pro) dão **404** com a chave atual, então
-   não servem de reserva.
+   não servem de reserva. **Mitigação:** cascata `GEMINI_MODELS` × `GEMINI_API_KEYS` (uma chave por
+   projeto do Google Cloud, pois a cota é por projeto) que pula 404/429/503 na hora, e depois fallback
+   gratuito OpenAI-compatível (Groq / GitHub Models / OpenRouter) validado pelo mesmo `VideoScript`.
 6. **Perfil do Chromium criado no Windows não abre no Linux** (cookies cifrados pelo SO): por isso
    existe o `storage_state.json`, reimportado no container.
 7. **Senha do Postgres com caractere especial** precisa ser codificada na `DATABASE_URL`.

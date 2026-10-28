@@ -6,6 +6,7 @@ import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote, unquote
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -27,9 +28,87 @@ def _path(name: str, default: Path) -> Path:
     return Path(value) if value else default
 
 
+def _list(name: str) -> list[str]:
+    return [item.strip() for item in os.getenv(name, "").split(",") if item.strip()]
+
+
+# Tried in order; a model that 404s for a key is skipped instantly. Check what your key sees with:
+#   python -c "from google import genai; c = genai.Client(api_key='KEY'); print([m.name for m in c.models.list()])"
+DEFAULT_GEMINI_MODELS = ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+
+
+def _gemini_keys() -> list[str]:
+    """GEMINI_API_KEYS (comma-separated, ideally one per Google Cloud project) + legacy GEMINI_API_KEY."""
+    keys = _list("GEMINI_API_KEYS")
+    single = os.getenv("GEMINI_API_KEY", "").strip()
+    if single and single not in keys:
+        keys.append(single)
+    return keys
+
+
+def _gemini_models() -> list[str]:
+    models = _list("GEMINI_MODELS")
+    legacy = os.getenv("GEMINI_MODEL", "").strip()
+    if not models:
+        models = list(DEFAULT_GEMINI_MODELS)
+        if legacy:  # an explicit GEMINI_MODEL goes first, the defaults stay as cascade
+            models = [legacy] + [m for m in models if m != legacy]
+    return models
+
+
+class FallbackLLM(BaseModel):
+    """OpenAI-compatible chat-completions endpoint used when every Gemini key/model fails."""
+
+    name: str
+    url: str
+    api_key: str
+    model: str
+
+
+def _fallback_llms() -> list[FallbackLLM]:
+    candidates = [
+        ("groq", "https://api.groq.com/openai/v1/chat/completions",
+         os.getenv("GROQ_API_KEY"), os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")),
+        ("github", "https://models.github.ai/inference/chat/completions",
+         os.getenv("GITHUB_MODELS_TOKEN"), os.getenv("GITHUB_MODELS_MODEL", "openai/gpt-4o-mini")),
+        ("openrouter", "https://openrouter.ai/api/v1/chat/completions",
+         os.getenv("OPENROUTER_API_KEY"), os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")),
+        ("custom", os.getenv("FALLBACK_LLM_URL", ""),
+         os.getenv("FALLBACK_LLM_API_KEY"), os.getenv("FALLBACK_LLM_MODEL", "")),
+    ]
+    return [FallbackLLM(name=name, url=url, api_key=key.strip(), model=model)
+            for name, url, key, model in candidates if key and key.strip() and url and model]
+
+
+def _sanitize_database_url(url: str) -> str:
+    """URL-encode the password so '@', '#', ':', '/', '%', '?' and '&' don't break SQLAlchemy's parser."""
+    scheme, sep, rest = url.partition("://")
+    if not sep or "@" not in rest:
+        return url
+    userinfo, _, hostpart = rest.rpartition("@")  # host/db never contain '@'; the password may
+    user, colon, password = userinfo.partition(":")
+    if not colon or quote(unquote(password), safe="") == password:  # no password, or already encoded
+        return url
+    return f"{scheme}://{user}:{quote(password, safe='')}@{hostpart}"
+
+
+def _database_url() -> str:
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        user, password = os.getenv("POSTGRES_USER"), os.getenv("POSTGRES_PASSWORD")
+        if user and password:
+            host = os.getenv("POSTGRES_HOST", "localhost")
+            port = os.getenv("POSTGRES_PORT", "5432")
+            db = os.getenv("POSTGRES_DB", "dark_factory")
+            return f"postgresql+psycopg2://{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}/{db}"
+        url = "postgresql+psycopg2://factory:change_me@localhost:5432/dark_factory"
+    return _sanitize_database_url(url)
+
+
 class Settings(BaseModel):
-    gemini_api_key: str
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_api_keys: list[str]
+    gemini_models: list[str] = Field(default_factory=lambda: list(DEFAULT_GEMINI_MODELS))
+    fallback_llms: list[FallbackLLM] = Field(default_factory=list)
     pexels_api_key: str | None = None
     pollinations_token: str | None = None
     image_concurrency: int = 3
@@ -61,17 +140,16 @@ class Settings(BaseModel):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings(
-        gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
-        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+        gemini_api_keys=_gemini_keys(),
+        gemini_models=_gemini_models(),
+        fallback_llms=_fallback_llms(),
         pexels_api_key=os.getenv("PEXELS_API_KEY") or None,
         pollinations_token=os.getenv("POLLINATIONS_TOKEN") or None,
         image_concurrency=int(os.getenv("IMAGE_CONCURRENCY", "3")),
         render_threads=int(os.getenv("RENDER_THREADS", "2")),
         whisper_model=os.getenv("WHISPER_MODEL", "small"),
         whisper_device=os.getenv("WHISPER_DEVICE", "cpu"),
-        database_url=os.getenv(
-            "DATABASE_URL", "postgresql+psycopg2://factory:change_me@localhost:5432/dark_factory"
-        ),
+        database_url=_database_url(),
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
         timezone=os.getenv("TZ", "America/Sao_Paulo"),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
