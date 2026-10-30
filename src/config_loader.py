@@ -246,6 +246,7 @@ class ChannelConfig(BaseModel):
     overlay: OverlayConfig = Field(default_factory=OverlayConfig)
     grade: str = ""
     ambience: Literal["none", "wind"] = "none"  # low synthetic wind/sea bed under the music
+    parallax: bool = False  # 2.5D: rembg lifts each image's subject onto a faster-moving layer
 
     @property
     def is_character_channel(self) -> bool:

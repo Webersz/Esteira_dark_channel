@@ -37,6 +37,20 @@ SOUNDS: dict[str, tuple[str, list[str]]] = {
         "-f", "lavfi", "-i", f"aevalsrc='0.8*sin(2*PI*(1300-900*t/0.12)*t)*exp(-28*t)':d=0.22:s={SR}",
         "-af", "highpass=f=200,aformat=channel_layouts=stereo",
     ]),
+    # 2.2 s tension riser: noise + upward sine sweep swelling to a hard stop (the impact lands on its end)
+    "riser": ("sfx/riser.wav", [
+        "-f", "lavfi", "-i",
+        f"aevalsrc='(0.45*(random(0)*2-1)+0.5*sin(2*PI*(90+420*t*t)*t))*pow(t/2.2,2.2)':d=2.2:s={SR}",
+        "-af", "highpass=f=120,lowpass=f=7000,aecho=0.7:0.5:70|140:0.3|0.2,afade=t=out:st=2.15:d=0.05,"
+               "alimiter=limit=0.95,aformat=channel_layouts=stereo",
+    ]),
+    # 3.6 s of slow heartbeat (lub-dub every 0.9 s) for the build-up before a twist
+    "heartbeat": ("sfx/heartbeat.wav", [
+        "-f", "lavfi", "-i",
+        "aevalsrc='0.9*sin(2*PI*52*t)*exp(-22*mod(t,0.9))"
+        f"+0.6*sin(2*PI*46*t)*exp(-26*mod(t-0.22,0.9))*gte(mod(t,0.9),0.22)':d=3.6:s={SR}",
+        "-af", "lowpass=f=220,volume=1.6,alimiter=limit=0.95,aformat=channel_layouts=stereo",
+    ]),
     # 96 s dark drone: detuned low sines, slow tremolo, heartbeat pulse every 1.2 s, filtered noise bed
     "dark_tension": ("bgm/dark_tension.mp3", [
         "-f", "lavfi", "-i",

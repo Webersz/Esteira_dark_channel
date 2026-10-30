@@ -101,19 +101,27 @@ COUNTER_MOVE = {
 }
 
 
-def _zoompan(move: CameraMove, frames: int, k: float, seed: int, d: int, punch: bool = False) -> str:
+PARALLAX_MOVES = {CameraMove.PUSH_IN, CameraMove.PULL_OUT, CameraMove.SHAKE}  # pans would misalign the layers
+BG_DEPTH, FG_DEPTH = 0.45, 1.45  # zoom travel of each 2.5D layer relative to a flat shot
+
+
+def _zoompan(move: CameraMove, frames: int, k: float, seed: int, d: int, punch: bool = False,
+             depth: float = 1.0) -> str:
     """zoompan expression set. `k` = supersampling factor of the input (amplitudes are in input pixels).
 
     Smooth eased moves on every shot; only impact beats (`punch`) get a hard punch-in and a decaying shake.
+    `depth` scales the zoom travel: 2.5D layers share the start zoom and centre but travel different amounts,
+    so the foreground always stays larger than its copy in the background.
     """
     n = max(frames - 1, 1)
     e = f"((1-cos(PI*on/{n}))/2)"  # ease in-out 0 -> 1
+    travel, shake = 0.13 * depth, 0.06 * depth
     base = {
-        CameraMove.PUSH_IN: f"1.04+0.13*{e}",
-        CameraMove.PULL_OUT: f"1.17-0.13*{e}",
+        CameraMove.PUSH_IN: f"1.04+{travel:.3f}*{e}",
+        CameraMove.PULL_OUT: f"{1.04 + travel:.3f}-{travel:.3f}*{e}",
         CameraMove.PAN_LEFT: "1.16",
         CameraMove.PAN_RIGHT: "1.16",
-        CameraMove.SHAKE: f"1.10+0.06*{e}",
+        CameraMove.SHAKE: f"1.10+{shake:.3f}*{e}",
     }[move]
     x = {
         CameraMove.PAN_LEFT: f"(iw-iw/zoom)*(1-{e})",
@@ -139,8 +147,9 @@ def _sprite_size(sprite: Path) -> tuple[int, int]:
 
 def _render_scene(idx: int, asset: SceneAsset, scene: Scene, frames: int, channel: ChannelConfig,
                   out: Path, mirror: bool, path: Path | None = None, move: CameraMove | None = None,
-                  punch: bool = False) -> Path:
-    """Render one shot. `path`/`move` override the asset's main image and the scene's camera (second shots)."""
+                  punch: bool = False, fg: Path | None = None) -> Path:
+    """Render one shot. `path`/`move` override the asset's main image and the scene's camera (second shots);
+    `fg` is that image's foreground layer for 2.5D parallax."""
     dur = frames / FPS
     seed = idx * 7 + 3
     flip = ",hflip" if mirror else ""
@@ -157,7 +166,16 @@ def _render_scene(idx: int, asset: SceneAsset, scene: Scene, frames: int, channe
               f"crop={int(W * k)}:{int(H * k)},setsar=1{flip},{_zoompan(move, frames, k, seed, frames, punch)}"
 
     grade = f",{channel.grade}" if channel.grade else ""
-    if asset.sprite is not None:
+    if fg is not None and asset.kind == "image" and asset.sprite is None and move in PARALLAX_MOVES:
+        # 2.5D: background travels little and goes slightly soft, the lifted subject travels a lot
+        frame = f"scale={int(W * k)}:{int(H * k)}:force_original_aspect_ratio=increase,crop={int(W * k)}:{int(H * k)},setsar=1{flip}"
+        inputs += ["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}", "-i", str(fg)]
+        graph = (
+            f"[0:v]{frame},{_zoompan(move, frames, k, seed, frames, punch, BG_DEPTH)},gblur=sigma=1.5[bg];"
+            f"[1:v]format=rgba,{frame},{_zoompan(move, frames, k, seed, frames, punch, FG_DEPTH)},format=rgba[fg];"
+            f"[bg][fg]overlay=0:0:format=auto{grade},format=yuv420p[v]"
+        )
+    elif asset.sprite is not None:
         sw, sh = _sprite_size(asset.sprite)
         side = -1 if idx % 2 else 1
         inputs += ["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}", "-i", str(asset.sprite)]
@@ -192,7 +210,8 @@ def _sfx_events(scenes: list[Scene], starts: list[float], assets: list[SceneAsse
         t = starts[i]
         kind = scenes[i].sfx
         if kind == TransitionSfx.IMPACT:
-            events += [("impact", t, 0.8)]
+            # Build-up into the twist: heartbeat, then a riser that ends exactly on the impact
+            events += [("heartbeat", max(0.0, t - 3.6), 0.6), ("riser", max(0.0, t - 2.2), 0.5), ("impact", t, 0.9)]
         elif kind == TransitionSfx.POP:
             events += [("whoosh", max(0.0, t - 0.12), 0.25), ("pop", t, 0.5)]
         elif kind == TransitionSfx.WHOOSH:
@@ -204,8 +223,11 @@ def _sfx_events(scenes: list[Scene], starts: list[float], assets: list[SceneAsse
     return events
 
 
+MUSIC_DROP_S = 0.45  # the music cuts out right before each impact so the hit lands in near-silence
+
+
 def _final_pass(base: Path, narration: Path, subs: Path, channel: ChannelConfig, events, total: float,
-                out: Path, workdir: Path) -> None:
+                out: Path, workdir: Path, drops: list[float] = ()) -> None:
     media = get_settings().media_dir
     args = ["-i", str(base), "-i", str(narration)]
     next_input = 2
@@ -213,6 +235,8 @@ def _final_pass(base: Path, narration: Path, subs: Path, channel: ChannelConfig,
 
     bgm = media / channel.bgm.file
     bgm_idx = None
+    windows = "+".join(f"between(t,{max(0.0, t - MUSIC_DROP_S):.2f},{t:.2f})" for t in drops)
+    music_drops = f",volume='if({windows},0.06,1)':eval=frame" if windows else ""
     if bgm.exists():
         args += ["-stream_loop", "-1", "-i", str(bgm)]
         bgm_idx, next_input = next_input, next_input + 1
@@ -236,7 +260,7 @@ def _final_pass(base: Path, narration: Path, subs: Path, channel: ChannelConfig,
     graph.append(f"[1:a]{AUDIO_FMT},asplit=2[narr][key]")
     if bgm_idx is not None:
         graph.append(
-            f"[{bgm_idx}:a]{AUDIO_FMT},atrim=0:{total:.3f},volume={channel.bgm.volume},afade=t=in:d=1.2[bgraw];"
+            f"[{bgm_idx}:a]{AUDIO_FMT},atrim=0:{total:.3f},volume={channel.bgm.volume},afade=t=in:d=1.2{music_drops}[bgraw];"
             f"[bgraw][key]sidechaincompress=threshold=0.025:ratio=10:attack=15:release=350[bgm]"
         )
         mix.append("[bgm]")
@@ -267,7 +291,9 @@ def _final_pass(base: Path, narration: Path, subs: Path, channel: ChannelConfig,
     )
     run_ffmpeg([
         *args, "-filter_complex", ";".join(graph), "-map", "[vout]", "-map", "[aout]",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-profile:v", "high", "-pix_fmt", "yuv420p",
+        # maxrate caps texture-heavy shots (fog, dust, rain): uncapped CRF 20 once produced 450 MB per minute
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-maxrate", "8M", "-bufsize", "16M",
+        "-profile:v", "high", "-pix_fmt", "yuv420p",
         "-r", str(FPS), "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-t", f"{total:.3f}",
         "-movflags", "+faststart", str(out),
     ], cwd=workdir)
@@ -288,7 +314,7 @@ def render_video(script: VideoScript, assets: list[SceneAsset], narration: Path,
     # Loop: the very last shot reuses the opening image, so the end flows straight back into frame 0
     last = len(assets) - 1
     if assets[0].kind == "image" and assets[last].second is not None:
-        assets[last].second = assets[0].path
+        assets[last].second, assets[last].second_fg = assets[0].path, assets[0].fg
 
     clips_dir = workdir / "clips"
     clips_dir.mkdir(exist_ok=True)
@@ -299,14 +325,14 @@ def render_video(script: VideoScript, assets: list[SceneAsset], narration: Path,
             punch = i == 0 or scene.sfx == TransitionSfx.IMPACT  # the opening frame hits too
             if asset.second is None:
                 jobs.append(pool.submit(_render_scene, i, asset, scene, n, channel,
-                                        clips_dir / f"scene_{i:02d}.mp4", mirror, punch=punch))
+                                        clips_dir / f"scene_{i:02d}.mp4", mirror, punch=punch, fg=asset.fg))
                 continue
             first = split_frame(i, starts[i], n, counts, words)
             jobs.append(pool.submit(_render_scene, i, asset, scene, first, channel,
-                                    clips_dir / f"scene_{i:02d}a.mp4", mirror, punch=punch))
+                                    clips_dir / f"scene_{i:02d}a.mp4", mirror, punch=punch, fg=asset.fg))
             jobs.append(pool.submit(_render_scene, i + 100, asset, scene, n - first, channel,
                                     clips_dir / f"scene_{i:02d}b.mp4", False, asset.second,
-                                    COUNTER_MOVE[scene.camera]))
+                                    COUNTER_MOVE[scene.camera], fg=asset.second_fg))
         clips = [job.result() for job in jobs]
 
     # Callouts slam in at their scene's cut; impact beats get a white flash
@@ -322,7 +348,7 @@ def render_video(script: VideoScript, assets: list[SceneAsset], narration: Path,
     run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(base)])
 
     final = workdir / "final.mp4"
-    _final_pass(base, narration, subs, channel, events, total, final, workdir)
+    _final_pass(base, narration, subs, channel, events, total, final, workdir, drops=flashes)
     duration = probe_duration(final)
     if not channel.min_duration - 0.1 <= duration <= channel.max_duration + 0.1:
         raise RenderError(f"Final duration {duration:.2f}s outside [{channel.min_duration}, {channel.max_duration}]")

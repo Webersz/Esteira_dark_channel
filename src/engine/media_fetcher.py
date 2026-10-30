@@ -43,6 +43,8 @@ class SceneAsset:
     sprite: Path | None = None  # transparent PNG for 2.5D compositing
     procedural: bool = False  # tier-3 local fallback was used
     second: Path | None = None  # image for the second half of the scene (two shots per scene)
+    fg: Path | None = None  # full-frame RGBA foreground of `path` for 2.5D parallax
+    second_fg: Path | None = None
 
 
 # --------------------------------------------------------------------------- download helpers
@@ -88,6 +90,7 @@ ANON_INTERVAL_S = 46.0
 _throttle_lock: asyncio.Lock | None = None
 _last_request = 0.0
 _key_exhausted = False  # pollen balance hit 0 during this run: fall back to the anonymous tier
+ANON_KEEP = 0.93  # fraction of width/height kept from anonymous images (crops the watermark)
 
 
 def _mark_key_exhausted() -> None:
@@ -142,6 +145,12 @@ async def _pollinations_image(session, sem, prompt: str, seed: int, dest: Path, 
             # After a timeout the server keeps generating and counts it against the free window
             slot.penalize = img is None
         if img is not None:
+            if headers is None:
+                # The anonymous tier ignores nologo and stamps "pollinations.ai" in the bottom ~4%:
+                # keep the top 93% (centred horizontally, same 9:16 ratio)
+                cw, ch = round(img.width * ANON_KEEP), round(img.height * ANON_KEEP)
+                left = (img.width - cw) // 2
+                img = img.crop((left, 0, left + cw, ch))
             img.save(dest, "JPEG", quality=94)
             if attempt > 1:
                 log.info("image %s OK on attempt %d (%s)", dest.name, attempt, model)
@@ -225,6 +234,39 @@ def save_clean_cutout(rgba: Image.Image, dest: Path, pad: int = 8) -> bool:
     return True
 
 
+PARALLAX_COVERAGE = (0.06, 0.70)  # below: nothing to lift; above: the "foreground" is the whole frame
+
+
+def _layer_sync(src: Path, dest: Path) -> bool:
+    """Full-frame foreground layer (soft alpha, same size as the image) for 2.5D parallax."""
+    global _rembg_session
+    from rembg import new_session, remove  # heavy import, keep lazy
+
+    if _rembg_session is None:
+        _rembg_session = new_session("isnet-general-use")
+    img = Image.open(src).convert("RGB")
+    alpha = remove(img, session=_rembg_session, post_process_mask=True).getchannel("A")
+    coverage = sum(1 for a in alpha.getdata() if a > 20) / (img.width * img.height)
+    if not PARALLAX_COVERAGE[0] <= coverage <= PARALLAX_COVERAGE[1]:
+        return False
+    layer = img.convert("RGBA")
+    layer.putalpha(alpha.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.GaussianBlur(3)))  # soft, no halo
+    layer.save(dest, "PNG")
+    return True
+
+
+async def _layer(src: Path | None) -> Path | None:
+    if src is None:
+        return None
+    dest = src.with_name(f"{src.stem}_fg.png")
+    try:
+        ok = await asyncio.get_running_loop().run_in_executor(_rembg_pool, _layer_sync, src, dest)
+    except Exception as exc:
+        log.warning("parallax layer failed for %s: %s", src.name, exc)
+        return None
+    return dest if ok else None
+
+
 async def _cutout(src: Path, dest: Path) -> bool:
     try:
         return await asyncio.get_running_loop().run_in_executor(_rembg_pool, _cutout_sync, src, dest)
@@ -269,7 +311,13 @@ async def _fetch_scene(i, scene, channel: ChannelConfig, assets_dir: Path, sessi
 
     # 4) Mascot from the channel's fixed library (same character in every video)
     sprite = mascot.pick_sprite(sprites, scene.character_pose, i) if use_sprite else None
-    return SceneAsset(i, "image", bg, sprite, procedural, second)
+
+    # 5) 2.5D: lift the main subject onto its own layer (not for mascot or procedural frames)
+    fg = second_fg = None
+    if channel.parallax and not use_sprite:
+        fg = None if procedural else await _layer(bg)
+        second_fg = await _layer(second)
+    return SceneAsset(i, "image", bg, sprite, procedural, second, fg, second_fg)
 
 
 # --------------------------------------------------------------------------- mascot library
@@ -336,8 +384,8 @@ async def fetch_scene_assets(script: VideoScript, channel: ChannelConfig, workdi
         ))
 
     procedural = sum(a.procedural for a in assets)
-    log.info("[%s] assets ready: %d images, %d clips, %d sprites, %d procedural", channel.id,
+    log.info("[%s] assets ready: %d images, %d clips, %d sprites, %d parallax layers, %d procedural", channel.id,
              sum(a.kind == "image" for a in assets) + sum(a.second is not None for a in assets),
-             sum(a.kind == "video" for a in assets),
-             sum(a.sprite is not None for a in assets), procedural)
+             sum(a.kind == "video" for a in assets), sum(a.sprite is not None for a in assets),
+             sum((a.fg is not None) + (a.second_fg is not None) for a in assets), procedural)
     return list(assets)
