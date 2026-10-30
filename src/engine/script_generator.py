@@ -32,6 +32,10 @@ ROUND_WAITS = (60, 180)  # sleep between rounds (rides out short "high demand" s
 SKIP_CODES = {400, 429, 500, 502, 503, 504}  # try the next key/model right away (400: e.g. no response_schema)
 UNAVAILABLE_CODES = {403, 404}  # model not enabled for this key: never retried in this process
 FALLBACK_TIMEOUT = 120
+# Gemini 3 "thinking" shares max_output_tokens with the JSON: at default level it used ~4.8k of 8k
+# tokens and sometimes truncated the script. "low" skips it, ~3x faster, scripts still valid.
+THINKING_LEVEL = "low"
+MAX_OUTPUT_TOKENS = 16384
 TWIST_SCENE = 7  # 1-based, lands around the 25 s mark
 
 # Rotated per video (anti format fatigue). Each rule is injected for scene 1 only.
@@ -161,7 +165,8 @@ def _gemini_once(model: str, api_key: str, prompt: str) -> VideoScript:
         response_schema=VideoScript,
         temperature=1.0,
         top_p=0.95,
-        max_output_tokens=8192,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+        thinking_config=types.ThinkingConfig(thinking_level=THINKING_LEVEL),
     )
     response = _get_client(api_key).models.generate_content(model=model, contents=prompt, config=config)
     if isinstance(response.parsed, VideoScript):
@@ -253,6 +258,7 @@ def generate_script(channel: ChannelConfig, recent_topics: list[str], extra_feed
         try:
             script = _sanitize(_call_llm(_build_prompt(channel, recent_topics, feedback, hook)))
         except ValueError as exc:  # pydantic ValidationError subclasses ValueError
+            log.warning("[%s] script attempt %d: invalid JSON/schema: %s", channel.id, attempt, str(exc)[:300])
             feedback = [f"Your JSON did not match the schema: {str(exc)[:400]}"]
             continue
         if len(script.scenes) > channel.scenes:
