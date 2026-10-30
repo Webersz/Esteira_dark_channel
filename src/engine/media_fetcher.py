@@ -25,6 +25,9 @@ from src.engine.schemas import VideoScript
 log = logging.getLogger(__name__)
 
 POLLINATIONS_URL = "https://image.pollinations.ai/prompt/{prompt}?width={w}&height={h}&model={model}&seed={seed}&nologo=true"
+# Pollen keys (sk_...) from enter.pollinations.ai only lift the 45 s limit on the gen endpoint;
+# image.pollinations.ai ignores them. That endpoint has no "turbo": tier 2 uses Z-Image Turbo.
+POLLINATIONS_KEY_URL = "https://gen.pollinations.ai/image/{prompt}?width={w}&height={h}&model={model}&seed={seed}&nologo=true"
 PEXELS_SEARCH = "https://api.pexels.com/videos/search"
 NEGATIVE_HINT = "no text, no watermark, no letters, no logo"
 
@@ -105,14 +108,15 @@ async def _anon_slot():
 
 
 async def _pollinations_image(session, sem, prompt: str, seed: int, dest: Path, w: int = 1080, h: int = 1920) -> bool:
-    """Tier 1: Flux x3 (backoff 2/5/10 s). Tier 2: Turbo x2 with a mutated seed. False if both tiers fail."""
+    """Tier 1: Flux x3 (backoff 2/5/10 s). Tier 2: Turbo/Z-Image x2 with a mutated seed. False if both tiers fail."""
     settings = get_settings()
     headers = {"Authorization": f"Bearer {settings.pollinations_token}"} if settings.pollinations_token else None
     encoded = quote(prompt[:900], safe="")
+    url_template, tier2 = (POLLINATIONS_KEY_URL, "zimage") if settings.pollinations_token else (POLLINATIONS_URL, "turbo")
     plan = [("flux", seed, wait) for wait in TIER1_BACKOFF]
-    plan += [("turbo", seed + random.randint(1, 9999), 0) for _ in range(TIER2_ATTEMPTS)]
+    plan += [(tier2, seed + random.randint(1, 9999), 0) for _ in range(TIER2_ATTEMPTS)]
     for attempt, (model, current_seed, wait) in enumerate(plan, start=1):
-        url = POLLINATIONS_URL.format(prompt=encoded, w=w, h=h, seed=current_seed, model=model)
+        url = url_template.format(prompt=encoded, w=w, h=h, seed=current_seed, model=model)
         async with _anon_slot() as slot:
             img = _valid_image(await _fetch_bytes(session, url, sem, headers=headers, retries=1))
             # After a timeout the server keeps generating and counts it against the free window
