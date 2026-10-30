@@ -56,6 +56,9 @@ async def _fetch_bytes(session: aiohttp.ClientSession, url: str, sem: asyncio.Se
                 async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
                     if resp.status == 200:
                         return await resp.read()
+                    if resp.status == 402 and "INSUFFICIENT_BALANCE" in await resp.text():
+                        _mark_key_exhausted()
+                        return None
                     log.warning("GET %s -> HTTP %s", url[:90], resp.status)
                     if resp.status in (400, 401, 403, 404):
                         return None
@@ -84,6 +87,19 @@ ANON_INTERVAL_S = 46.0
 
 _throttle_lock: asyncio.Lock | None = None
 _last_request = 0.0
+_key_exhausted = False  # pollen balance hit 0 during this run: fall back to the anonymous tier
+
+
+def _mark_key_exhausted() -> None:
+    global _key_exhausted
+    if not _key_exhausted:
+        log.error("Pollinations pollen balance is 0 (HTTP 402): switching to the anonymous tier (1 image/46 s, "
+                  "no second shots). Top up or wait for the daily grant at https://enter.pollinations.ai")
+    _key_exhausted = True
+
+
+def _use_key() -> bool:
+    return bool(get_settings().pollinations_token) and not _key_exhausted
 
 
 @contextlib.asynccontextmanager
@@ -92,7 +108,7 @@ async def _anon_slot():
     *finished* (the free-tier window is counted from generation end). No-op with POLLINATIONS_TOKEN."""
     global _throttle_lock, _last_request
     slot = types.SimpleNamespace(penalize=False)  # caller sets True on failure -> one extra window of rest
-    if get_settings().pollinations_token:
+    if _use_key():
         yield slot
         return
     if _throttle_lock is None:
@@ -110,13 +126,16 @@ async def _anon_slot():
 
 async def _pollinations_image(session, sem, prompt: str, seed: int, dest: Path, w: int = 1080, h: int = 1920) -> bool:
     """Tier 1: Flux x3 (backoff 2/5/10 s). Tier 2: Turbo/Z-Image x2 with a mutated seed. False if both tiers fail."""
-    settings = get_settings()
-    headers = {"Authorization": f"Bearer {settings.pollinations_token}"} if settings.pollinations_token else None
     encoded = quote(prompt[:900], safe="")
-    url_template, tier2 = (POLLINATIONS_KEY_URL, "zimage") if settings.pollinations_token else (POLLINATIONS_URL, "turbo")
-    plan = [("flux", seed, wait) for wait in TIER1_BACKOFF]
-    plan += [(tier2, seed + random.randint(1, 9999), 0) for _ in range(TIER2_ATTEMPTS)]
-    for attempt, (model, current_seed, wait) in enumerate(plan, start=1):
+    plan = [(1, seed, wait) for wait in TIER1_BACKOFF]
+    plan += [(2, seed + random.randint(1, 9999), 0) for _ in range(TIER2_ATTEMPTS)]
+    for attempt, (tier, current_seed, wait) in enumerate(plan, start=1):
+        # Re-checked every attempt: the pollen balance can run out mid-video
+        if _use_key():
+            url_template, model = POLLINATIONS_KEY_URL, "flux" if tier == 1 else "zimage"
+            headers = {"Authorization": f"Bearer {get_settings().pollinations_token}"}
+        else:
+            url_template, model, headers = POLLINATIONS_URL, "flux" if tier == 1 else "turbo", None
         url = url_template.format(prompt=encoded, w=w, h=h, seed=current_seed, model=model)
         async with _anon_slot() as slot:
             img = _valid_image(await _fetch_bytes(session, url, sem, headers=headers, retries=1))
@@ -242,7 +261,7 @@ async def _fetch_scene(i, scene, channel: ChannelConfig, assets_dir: Path, sessi
     # 3) Second shot for the other half of the line. Skipped on the anonymous tier (it would double the
     #    46 s/image pacing) and for mascot scenes, whose sprite already carries the motion.
     second = None
-    if scene.image_prompt_b and not use_sprite and get_settings().pollinations_token:
+    if scene.image_prompt_b and not use_sprite and _use_key():
         b_prompt = f"{scene.image_prompt_b}, {channel.visual_style}, vertical 9:16 composition, {NEGATIVE_HINT}"
         b_path = assets_dir / f"scene_{i:02d}_b.jpg"
         if await _pollinations_image(session, sem, b_prompt, base_seed + 500 + i, b_path):
@@ -292,8 +311,9 @@ async def build_mascot_library(channel: ChannelConfig, force: bool = False) -> N
 async def fetch_scene_assets(script: VideoScript, channel: ChannelConfig, workdir: Path) -> list[SceneAsset]:
     assets_dir = workdir / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
-    global _throttle_lock
+    global _throttle_lock, _key_exhausted
     _throttle_lock = None  # asyncio.Lock is bound to the event loop; each asyncio.run() gets a fresh one
+    _key_exhausted = False  # the daily pollen grant may have refilled since the last video
     base_seed = int(hashlib.md5(script.topic.encode()).hexdigest()[:7], 16)
     if not get_settings().pollinations_token:
         n = len(script.scenes)

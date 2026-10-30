@@ -109,6 +109,11 @@ VISUAL STYLE (for image prompts): {channel.visual_style}{mascot_rules}
 
 HOOK ARCHETYPE: {hook}
 SCENE 1 RULE (strict): {HOOK_ARCHETYPES[hook]}
+SCENE 1 VISUAL + CALLOUT (strict): the viewer decides to stay in the first second, before hearing a word.
+  - `image_prompt` of scene 1 is the single most disturbing or intriguing image of the whole story (the key
+    evidence, the impossible detail), never an establishing/landscape shot.
+  - `callout` of scene 1 states the most shocking fact in 2-3 words (e.g. "3 HOMENS SUMIRAM", "NINGUÉM SOBREVIVEU"),
+    never a neutral measurement or date.
 SCENE {TWIST_SCENE} RULE (strict): plot twist / pattern interrupt; set its sfx to "impact" and camera to "shake".
 SCENE {channel.scenes} RULE (strict): climax in the first 7 words, ends with an open connector that loops into scene 1, no final period.
 

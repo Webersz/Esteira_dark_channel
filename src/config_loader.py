@@ -172,7 +172,10 @@ def get_settings() -> Settings:
 
 
 class VoiceConfig(BaseModel):
-    voice: str = "pt-BR-AntonioNeural"
+    engine: Literal["gemini", "edge"] = "edge"  # gemini falls back to edge-tts if every model/key fails
+    gemini_voice: str = "Charon"
+    direction: str = "Brazilian Portuguese narrator, natural and engaging; brisk short-video pace."
+    voice: str = "pt-BR-AntonioNeural"  # edge-tts voice (engine "edge" and the fallback)
     rate: str = "+0%"  # edge-tts native rate
     pitch_semitones: float = 0.0  # applied with FFmpeg asetrate/aresample
     tempo: float = 1.0  # applied with FFmpeg atempo (auto-adjusted to hit the duration window)

@@ -296,7 +296,7 @@ def render_video(script: VideoScript, assets: list[SceneAsset], narration: Path,
     with ThreadPoolExecutor(max_workers=get_settings().render_threads) as pool:
         for i, (asset, scene, n) in enumerate(zip(assets, script.scenes, frames)):
             mirror = i > 0 and asset.path == assets[i - 1].path  # reused asset: flip so it reads as a new shot
-            punch = i > 0 and scene.sfx == TransitionSfx.IMPACT
+            punch = i == 0 or scene.sfx == TransitionSfx.IMPACT  # the opening frame hits too
             if asset.second is None:
                 jobs.append(pool.submit(_render_scene, i, asset, scene, n, channel,
                                         clips_dir / f"scene_{i:02d}.mp4", mirror, punch=punch))
@@ -311,10 +311,10 @@ def render_video(script: VideoScript, assets: list[SceneAsset], narration: Path,
 
     # Callouts slam in at their scene's cut; impact beats get a white flash
     callouts = [(0.0 if i == 0 else starts[i] + 0.1, min(starts[i] + 2.6, starts[i] + frames[i] / FPS - 0.1),
-                 s.callout) for i, s in enumerate(script.scenes) if s.callout]
+                 s.callout, i == 0 or s.sfx == TransitionSfx.IMPACT) for i, s in enumerate(script.scenes) if s.callout]
     flashes = [starts[i] for i, s in enumerate(script.scenes) if i > 0 and s.sfx == TransitionSfx.IMPACT]
     add_overlays(subs, channel.subtitle, callouts, flashes)
-    events = _sfx_events(script.scenes, starts, assets) + [("pop", t, 0.35) for t, _, _ in callouts if t > 0]
+    events = _sfx_events(script.scenes, starts, assets) + [("pop", c[0], 0.35) for c in callouts if c[0] > 0]
 
     concat_list = workdir / "concat.txt"
     concat_list.write_text("".join(f"file '{c.as_posix()}'\n" for c in clips), encoding="utf-8")

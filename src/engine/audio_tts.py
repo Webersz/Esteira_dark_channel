@@ -1,15 +1,19 @@
-"""edge-tts voice-over + FFmpeg pitch/tempo shaping that lands the narration inside the monetization window."""
+"""Voice-over (Gemini TTS, edge-tts fallback) + FFmpeg pitch/tempo shaping that lands the narration inside
+the monetization window."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import subprocess
+import wave
 from pathlib import Path
 
 import edge_tts
+from google.genai import errors as genai_errors
+from google.genai import types
 
-from src.config_loader import ChannelConfig
+from src.config_loader import ChannelConfig, get_settings
 
 log = logging.getLogger(__name__)
 
@@ -61,13 +65,65 @@ async def _edge_tts(text: str, voice: str, rate: str, out_path: Path, retries: i
     raise RuntimeError("edge-tts failed after retries")
 
 
+GEMINI_TTS_MODELS = ["gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"]
+
+
+def _gemini_tts(text: str, voice: str, direction: str, out_wav: Path) -> None:
+    """Gemini TTS over models x keys. The direction goes in a structured prompt: these models reject
+    system instructions, and a plain "Read like...: <text>" prefix gets spoken aloud."""
+    from src.engine.script_generator import _get_client  # shared per-key client cache
+
+    prompt = f"# AUDIO PROFILE\n{direction}\n\n# TRANSCRIPT (read only this)\n{text}"
+    config = types.GenerateContentConfig(
+        response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice))
+        ),
+    )
+    failures = []
+    for model in GEMINI_TTS_MODELS:
+        for idx, key in enumerate(get_settings().gemini_api_keys, start=1):
+            try:
+                response = _get_client(key).models.generate_content(model=model, contents=prompt, config=config)
+                pcm = response.candidates[0].content.parts[0].inline_data.data
+            except genai_errors.APIError as exc:
+                failures.append(f"{model} key#{idx}: HTTP {exc.code}")
+                if exc.code in (400, 403, 404):
+                    break  # model unusable: skip its other keys
+                continue
+            except (AttributeError, IndexError, TypeError):
+                failures.append(f"{model} key#{idx}: no audio")
+                continue
+            with wave.open(str(out_wav), "wb") as wav:  # 24 kHz mono 16-bit PCM
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(24000)
+                wav.writeframes(pcm)
+            log.info("Narration via %s (key #%d, voice %s)", model, idx, voice)
+            return
+    raise RuntimeError(f"Gemini TTS failed: {'; '.join(failures[-6:])}")
+
+
+def _voice_over(text: str, channel: ChannelConfig, workdir: Path) -> Path:
+    voice = channel.voice
+    if voice.engine == "gemini" and get_settings().gemini_api_keys:
+        raw_wav = workdir / "narration_raw.wav"
+        try:
+            _gemini_tts(text, voice.gemini_voice, voice.direction, raw_wav)
+            return raw_wav
+        except RuntimeError as exc:
+            log.warning("[%s] %s -> falling back to edge-tts", channel.id, exc)
+    raw_mp3 = workdir / "narration_raw.mp3"
+    asyncio.run(_edge_tts(text, voice.voice, voice.rate, raw_mp3))
+    return raw_mp3
+
+
 def synthesize(text: str, channel: ChannelConfig, workdir: Path) -> tuple[Path, float]:
     """Return (narration.wav, duration). Duration + TAIL_SECONDS is guaranteed inside [min, max]."""
     voice = channel.voice
-    raw_mp3 = workdir / "narration_raw.mp3"
     out_wav = workdir / "narration.wav"
-    asyncio.run(_edge_tts(text, voice.voice, voice.rate, raw_mp3))
-    raw_duration, sample_rate = probe_audio(raw_mp3)
+    raw_audio = _voice_over(text, channel, workdir)
+    raw_duration, sample_rate = probe_audio(raw_audio)
 
     # Margins absorb the leading/trailing silence trim applied below (measured on the raw file here)
     lo = channel.min_duration - TAIL_SECONDS + 0.8
@@ -94,7 +150,7 @@ def synthesize(text: str, channel: ChannelConfig, workdir: Path) -> tuple[Path, 
         "aresample=48000",
     ]
     subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw_mp3), "-af", ",".join(filters),
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw_audio), "-af", ",".join(filters),
          "-ac", "2", "-c:a", "pcm_s16le", str(out_wav)],
         check=True, capture_output=True, text=True,
     )

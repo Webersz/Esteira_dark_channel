@@ -189,21 +189,40 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return out_path
 
 
-def add_overlays(ass_path: Path, style: SubtitleConfig, callouts: list[tuple[float, float, str]],
+CALLOUT_MAX_SIZE = 112
+CALLOUT_MAX_WIDTH = 900  # px of the 1080 frame
+CALLOUT_CHAR_EM = 0.70  # average uppercase advance of heavy sans fonts, in em
+CALLOUT_BOX = "&H33000000"  # ~80% opaque black band behind the text
+CALLOUT_ALERT_BOX = "&H1A0E0EC8"  # ~90% opaque deep red for impact beats
+
+
+def add_overlays(ass_path: Path, style: SubtitleConfig, callouts: list[tuple[float, float, str, bool]],
                  flashes: list[float]) -> None:
-    """Append top-of-frame headline callouts and full-frame white flashes to an existing .ass file."""
-    outline = _ass_color(style.outline_color)
+    """Append top-of-frame headline callouts and full-frame white flashes to an existing .ass file.
+
+    Callouts sit on an opaque band (BorderStyle 3) so they stay legible on bright skies, shrink to fit
+    the frame width, and the band turns red on impact beats (`alert`).
+    """
     styles = (
-        f"Style: Callout,{style.font},112,&H00FFFFFF,&H00FFFFFF,{outline},&H00000000,-1,0,0,0,100,100,2,0,1,"
-        f"{style.outline + 1},0,8,60,60,300,1\n"
+        f"Style: Callout,{style.font},{CALLOUT_MAX_SIZE},&H00FFFFFF,&H00FFFFFF,{CALLOUT_BOX},&H00000000,"
+        "-1,0,0,0,100,100,1,0,3,12,0,8,60,60,300,1\n"
         "Style: Flash,Arial,10,&H00FFFFFF,&H00FFFFFF,&H00FFFFFF,&H00FFFFFF,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n"
     )
     events = []
-    for start, end, text in callouts:
+    for start, end, text, alert in callouts:
         if end - start < 0.3:
             continue
-        pop = "{\\fad(80,200)\\fscx135\\fscy135\\t(0,160,\\fscx100\\fscy100)}"  # slams in, settles
-        events.append(f"Dialogue: 2,{_ts(start)},{_ts(end)},Callout,,0,0,0,,{pop}{_clean(text, True)}")
+        lines = [_clean(text, True)]
+        if len(lines[0]) > 12 and " " in lines[0]:  # two big lines beat one tiny line: break near the middle
+            words = lines[0].split()
+            cut = min(range(1, len(words)), key=lambda k: abs(len(" ".join(words[:k])) - len(" ".join(words[k:]))))
+            lines = [" ".join(words[:cut]), " ".join(words[cut:])]
+        longest = max(len(line) for line in lines)
+        size = min(CALLOUT_MAX_SIZE, int(CALLOUT_MAX_WIDTH / (CALLOUT_CHAR_EM * max(longest, 1))))
+        label = "\\N".join(lines)
+        box = f"\\3c&H{CALLOUT_ALERT_BOX[4:]}&\\3a&H{CALLOUT_ALERT_BOX[2:4]}&" if alert else ""
+        pop = f"{{\\fs{size}{box}\\fad(80,200)\\fscx135\\fscy135\\t(0,160,\\fscx100\\fscy100)}}"  # slams in, settles
+        events.append(f"Dialogue: 2,{_ts(start)},{_ts(end)},Callout,,0,0,0,,{pop}{label}")
     for t in flashes:
         events.append(f"Dialogue: 3,{_ts(t)},{_ts(t + 0.35)},Flash,,0,0,0,,"
                       "{\\an7\\pos(0,0)\\fad(0,300)\\p1}m 0 0 l 1080 0 1080 1920 0 1920{\\p0}")
