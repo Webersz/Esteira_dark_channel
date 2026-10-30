@@ -34,6 +34,14 @@ class Scene(BaseModel):
         description="English prompt for a vertical 9:16 image that literally illustrates the narration. "
         "Describe subject, setting, lighting and camera angle. Never ask for text, letters or logos."
     )
+    image_prompt_b: str = Field(
+        description="Second English prompt for the same moment from another angle: a close-up of the key object "
+        "or detail, a wide establishing shot, or a reaction. Same rules as image_prompt; never the same framing."
+    )
+    callout: str = Field(
+        description="On-screen headline shown at the top while this scene plays: 1-3 words in the channel "
+        "language, e.g. '26 DEZ 1900', '0 CORPOS', 'TRANCADA POR DENTRO'. Empty string for most scenes."
+    )
     character_pose: str = Field(
         description="Mascot pose key for this scene (one of the keys listed in the prompt, e.g. 'pointing'). "
         "Empty string if the mascot should not appear or the channel has no mascot."

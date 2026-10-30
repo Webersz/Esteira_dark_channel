@@ -143,7 +143,7 @@ def run_pipeline(channel_id: str, force: bool = False, work_root: Path | None = 
     video_id = (db.create_video(channel_id, script.topic, script.title, script.model_dump(mode="json"), str(workdir))
                 if use_db else None)
     try:
-        words = align_to_script(transcribe_words(narration, channel.language, script.narration), script.narration)
+        words = align_to_script(transcribe_words(narration, channel.language), script.narration)
         subs = build_ass(words, channel.subtitle, workdir / "subs.ass", narration_dur + TAIL_SECONDS)
         assets = asyncio.run(fetch_scene_assets(script, channel, workdir))
         final, duration = render_video(script, assets, narration, narration_dur, words, subs, channel, workdir)

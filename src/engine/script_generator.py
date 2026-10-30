@@ -78,6 +78,13 @@ You write scripts engineered for maximum retention on YouTube Shorts and TikTok:
 - Write narration, title, description and comment with FULL, correct accentuation and cedilla (é, ã, ç, ô...).
   The voice-over engine mispronounces unaccented words ("e" vs "é", "mascaras" vs "máscaras").
 - Image prompts are in English, cinematic, vertical 9:16, describe a single clear focal subject, and never contain text.
+  Every prompt names the era and place of the story (e.g. "Scotland 1900") so all images look like the same world.
+  Real people are never shown with a visible face: use silhouettes, backs, hands or the objects they left behind.
+  Prefer concrete evidence (the locked door, the logbook, the twisted railing) over generic scenery.
+- Each scene has two images: `image_prompt` for the first half of the line, `image_prompt_b` for the second half,
+  with a different framing (wide vs close-up vs detail).
+- `callout` is a 1-3 word on-screen headline. Scene 1 always has one (the hook in a few words, e.g. "3 HOMENS SUMIRAM");
+  add 5-7 more on scenes with a date, a number or a shocking fact; leave it empty everywhere else.
 """
 
 
@@ -131,6 +138,8 @@ def _sanitize(script: VideoScript) -> VideoScript:
     for scene in script.scenes:
         scene.narration = re.sub(r"\s+", " ", _CLEAN_RE.sub("", scene.narration)).strip()
         scene.image_prompt = scene.image_prompt.strip()
+        scene.image_prompt_b = scene.image_prompt_b.strip()
+        scene.callout = re.sub(r"\s+", " ", _CLEAN_RE.sub("", scene.callout)).strip().upper()[:28]
         scene.character_pose = scene.character_pose.strip()
     if script.scenes:
         # Loop: no falling "end of sentence" intonation on the last line

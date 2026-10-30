@@ -34,7 +34,7 @@ def _get_model():
     return _model
 
 
-def transcribe_words(audio_path: Path, language: str, reference_text: str = "") -> list[Word]:
+def transcribe_words(audio_path: Path, language: str) -> list[Word]:
     segments, _info = _get_model().transcribe(
         str(audio_path),
         language=language.split("-")[0],
@@ -42,7 +42,8 @@ def transcribe_words(audio_path: Path, language: str, reference_text: str = "") 
         beam_size=5,
         vad_filter=False,
         condition_on_previous_text=False,
-        initial_prompt=reference_text[:800] or None,  # biases spelling toward the script
+        # No initial_prompt: passing the script made Whisper skip the first ~27 s of speech, and
+        # align_to_script already restores the script's spelling.
     )
     words: list[Word] = []
     for segment in segments:
@@ -186,3 +187,25 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     out_path.write_text(header + "\n".join(lines) + "\n", encoding="utf-8")
     log.info("ASS written: %d chunks, %d events", len(chunks), len(lines))
     return out_path
+
+
+def add_overlays(ass_path: Path, style: SubtitleConfig, callouts: list[tuple[float, float, str]],
+                 flashes: list[float]) -> None:
+    """Append top-of-frame headline callouts and full-frame white flashes to an existing .ass file."""
+    outline = _ass_color(style.outline_color)
+    styles = (
+        f"Style: Callout,{style.font},112,&H00FFFFFF,&H00FFFFFF,{outline},&H00000000,-1,0,0,0,100,100,2,0,1,"
+        f"{style.outline + 1},0,8,60,60,300,1\n"
+        "Style: Flash,Arial,10,&H00FFFFFF,&H00FFFFFF,&H00FFFFFF,&H00FFFFFF,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1\n"
+    )
+    events = []
+    for start, end, text in callouts:
+        if end - start < 0.3:
+            continue
+        pop = "{\\fad(80,200)\\fscx135\\fscy135\\t(0,160,\\fscx100\\fscy100)}"  # slams in, settles
+        events.append(f"Dialogue: 2,{_ts(start)},{_ts(end)},Callout,,0,0,0,,{pop}{_clean(text, True)}")
+    for t in flashes:
+        events.append(f"Dialogue: 3,{_ts(t)},{_ts(t + 0.35)},Flash,,0,0,0,,"
+                      "{\\an7\\pos(0,0)\\fad(0,300)\\p1}m 0 0 l 1080 0 1080 1920 0 1920{\\p0}")
+    text = ass_path.read_text(encoding="utf-8").replace("\n[Events]", styles + "\n[Events]", 1)
+    ass_path.write_text(text + "\n".join(events) + "\n", encoding="utf-8")

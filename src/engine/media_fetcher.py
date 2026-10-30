@@ -42,6 +42,7 @@ class SceneAsset:
     path: Path
     sprite: Path | None = None  # transparent PNG for 2.5D compositing
     procedural: bool = False  # tier-3 local fallback was used
+    second: Path | None = None  # image for the second half of the scene (two shots per scene)
 
 
 # --------------------------------------------------------------------------- download helpers
@@ -238,9 +239,18 @@ async def _fetch_scene(i, scene, channel: ChannelConfig, assets_dir: Path, sessi
         log.warning("[%s] scene %d: Pollinations tiers 1+2 failed -> tier 3 procedural frame", channel.id, i)
         await asyncio.to_thread(_procedural_image_sync, bg, base_seed + i)
 
-    # 3) Mascot from the channel's fixed library (same character in every video)
+    # 3) Second shot for the other half of the line. Skipped on the anonymous tier (it would double the
+    #    46 s/image pacing) and for mascot scenes, whose sprite already carries the motion.
+    second = None
+    if scene.image_prompt_b and not use_sprite and get_settings().pollinations_token:
+        b_prompt = f"{scene.image_prompt_b}, {channel.visual_style}, vertical 9:16 composition, {NEGATIVE_HINT}"
+        b_path = assets_dir / f"scene_{i:02d}_b.jpg"
+        if await _pollinations_image(session, sem, b_prompt, base_seed + 500 + i, b_path):
+            second = b_path
+
+    # 4) Mascot from the channel's fixed library (same character in every video)
     sprite = mascot.pick_sprite(sprites, scene.character_pose, i) if use_sprite else None
-    return SceneAsset(i, "image", bg, sprite, procedural)
+    return SceneAsset(i, "image", bg, sprite, procedural, second)
 
 
 # --------------------------------------------------------------------------- mascot library
@@ -307,6 +317,7 @@ async def fetch_scene_assets(script: VideoScript, channel: ChannelConfig, workdi
 
     procedural = sum(a.procedural for a in assets)
     log.info("[%s] assets ready: %d images, %d clips, %d sprites, %d procedural", channel.id,
-             sum(a.kind == "image" for a in assets), sum(a.kind == "video" for a in assets),
+             sum(a.kind == "image" for a in assets) + sum(a.second is not None for a in assets),
+             sum(a.kind == "video" for a in assets),
              sum(a.sprite is not None for a in assets), procedural)
     return list(assets)

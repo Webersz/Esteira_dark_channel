@@ -242,6 +242,7 @@ class ChannelConfig(BaseModel):
     subtitle: SubtitleConfig = Field(default_factory=SubtitleConfig)
     overlay: OverlayConfig = Field(default_factory=OverlayConfig)
     grade: str = ""
+    ambience: Literal["none", "wind"] = "none"  # low synthetic wind/sea bed under the music
 
     @property
     def is_character_channel(self) -> bool:

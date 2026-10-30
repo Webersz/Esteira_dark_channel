@@ -1,10 +1,11 @@
 """Master FFmpeg pipeline (no MoviePy).
 
-1. Each of the 16 scenes is rendered to its own clip (parallel):
-   - zoompan with a whip-zoom snap at the cut + Ken Burns move + mathematical handheld/impact shake
+1. Each scene becomes one or two shots (second image cut on the middle word), rendered in parallel:
+   - eased Ken Burns move; impact scenes get a punch-in + decaying shake (plus a white flash in the .ass)
    - 2.5D scenes: blurred parallax background + rembg sprite with sway, bob, drop shadow and pop-in entrance
 2. Clips are concatenated losslessly (concat demuxer, stream copy).
-3. Final pass: dust overlay (screen blend), .ass karaoke burn-in, narration + side-chain-ducked BGM + SFX hits.
+3. Final pass: dust overlay (screen blend), .ass karaoke + callouts burn-in, narration + side-chain-ducked BGM
+   + optional wind/sea bed + SFX hits.
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from src.config_loader import ChannelConfig, get_settings
 from src.engine.audio_tts import TAIL_SECONDS
 from src.engine.media_fetcher import SceneAsset
 from src.engine.schemas import CameraMove, Scene, TransitionSfx, VideoScript
-from src.engine.subtitles_ass import Word
+from src.engine.subtitles_ass import Word, add_overlays
 
 log = logging.getLogger(__name__)
 
@@ -76,40 +77,57 @@ def plan_scene_frames(total: float, scene_word_counts: list[int], words: list[Wo
     return frames
 
 
+def split_frame(scene_idx: int, start: float, frames: int, scene_word_counts: list[int], words: list[Word],
+                min_shot: float = 1.2) -> int:
+    """Frames of the first shot when a scene has two: cut just before its middle word."""
+    total_script_words = max(1, sum(scene_word_counts))
+    middle = sum(scene_word_counts[:scene_idx]) + scene_word_counts[scene_idx] / 2
+    idx = min(len(words) - 1, round(middle / total_script_words * len(words)))
+    dur = frames / FPS
+    cut = min(max(words[idx].start - 0.06 - start, min_shot), dur - min_shot)
+    return max(1, min(frames - 1, round(cut * FPS)))
+
+
 # --------------------------------------------------------------------------- camera math
 
 
-def _zoompan(move: CameraMove, frames: int, k: float, seed: int, d: int) -> str:
-    """zoompan expression set. `k` = supersampling factor of the input (amplitudes are in input pixels)."""
+# Second shot of a scene moves the opposite way so the cut reads as a new angle
+COUNTER_MOVE = {
+    CameraMove.PUSH_IN: CameraMove.PULL_OUT,
+    CameraMove.PULL_OUT: CameraMove.PUSH_IN,
+    CameraMove.PAN_LEFT: CameraMove.PAN_RIGHT,
+    CameraMove.PAN_RIGHT: CameraMove.PAN_LEFT,
+    CameraMove.SHAKE: CameraMove.PULL_OUT,
+}
+
+
+def _zoompan(move: CameraMove, frames: int, k: float, seed: int, d: int, punch: bool = False) -> str:
+    """zoompan expression set. `k` = supersampling factor of the input (amplitudes are in input pixels).
+
+    Smooth eased moves on every shot; only impact beats (`punch`) get a hard punch-in and a decaying shake.
+    """
     n = max(frames - 1, 1)
-    p = f"(on/{n})"
-    whip = "0.32*pow(max(0,1-on/7),2)"  # +32% zoom snapping back to 0 in ~0.23 s at every cut
+    e = f"((1-cos(PI*on/{n}))/2)"  # ease in-out 0 -> 1
     base = {
-        CameraMove.PUSH_IN: f"1.10+0.16*{p}",
-        CameraMove.PULL_OUT: f"1.28-0.16*{p}",
-        CameraMove.PAN_LEFT: "1.20",
-        CameraMove.PAN_RIGHT: "1.20",
-        CameraMove.SHAKE: f"1.16+0.05*{p}",
+        CameraMove.PUSH_IN: f"1.04+0.13*{e}",
+        CameraMove.PULL_OUT: f"1.17-0.13*{e}",
+        CameraMove.PAN_LEFT: "1.16",
+        CameraMove.PAN_RIGHT: "1.16",
+        CameraMove.SHAKE: f"1.10+0.06*{e}",
     }[move]
-    z = f"{base}+{whip}"
-
-    s1, s2, s3, s4 = (seed * 1.37) % 6.28, (seed * 2.11) % 6.28, (seed * 0.73) % 6.28, (seed * 3.07) % 6.28
-    handheld = (14 if move == CameraMove.SHAKE else 3) * k
-    burst = (26 if move == CameraMove.SHAKE else 8) * k  # decaying hit right after the cut
-    shake_x = (f"{handheld:.1f}*(sin(on*0.83+{s1:.2f})+0.6*sin(on*2.17+{s2:.2f}))"
-               f"+{burst:.1f}*exp(-on/5)*sin(on*2.9)")
-    shake_y = (f"{handheld:.1f}*(sin(on*0.67+{s3:.2f})+0.6*sin(on*1.91+{s4:.2f}))"
-               f"+{burst:.1f}*exp(-on/5)*cos(on*3.3)")
-
-    if move == CameraMove.PAN_LEFT:
-        x_base = f"(iw-iw/zoom)*(1-{p})"
-    elif move == CameraMove.PAN_RIGHT:
-        x_base = f"(iw-iw/zoom)*{p}"
-    else:
-        x_base = "(iw-iw/zoom)/2"
-    x = f"clip({x_base}+{shake_x},0,iw-iw/zoom)"
-    y = f"clip((ih-ih/zoom)/2+{shake_y},0,ih-ih/zoom)"
-    return f"zoompan=z='{z}':x='{x}':y='{y}':d={d}:s={W}x{H}:fps={FPS}"
+    x = {
+        CameraMove.PAN_LEFT: f"(iw-iw/zoom)*(1-{e})",
+        CameraMove.PAN_RIGHT: f"(iw-iw/zoom)*{e}",
+    }.get(move, "(iw-iw/zoom)/2")
+    y = "(ih-ih/zoom)/2"
+    z = base
+    if punch or move == CameraMove.SHAKE:
+        amp = 20 * k
+        z = f"{base}+0.22*pow(max(0,1-on/8),2)"  # +22% snapping back in ~0.27 s
+        x = f"{x}+{amp:.1f}*exp(-on/6)*sin(on*2.7+{seed % 6})"
+        y = f"{y}+{amp:.1f}*exp(-on/6)*cos(on*3.1+{seed % 6})"
+    return (f"zoompan=z='{z}':x='clip({x},0,iw-iw/zoom)':y='clip({y},0,ih-ih/zoom)'"
+            f":d={d}:s={W}x{H}:fps={FPS}")
 
 
 def _sprite_size(sprite: Path) -> tuple[int, int]:
@@ -120,20 +138,23 @@ def _sprite_size(sprite: Path) -> tuple[int, int]:
 
 
 def _render_scene(idx: int, asset: SceneAsset, scene: Scene, frames: int, channel: ChannelConfig,
-                  out: Path, mirror: bool) -> Path:
+                  out: Path, mirror: bool, path: Path | None = None, move: CameraMove | None = None,
+                  punch: bool = False) -> Path:
+    """Render one shot. `path`/`move` override the asset's main image and the scene's camera (second shots)."""
     dur = frames / FPS
     seed = idx * 7 + 3
     flip = ",hflip" if mirror else ""
+    move = move or scene.camera
     if asset.kind == "video":
         k = 1.5
         inputs = ["-stream_loop", "-1", "-i", str(asset.path)]
         src = f"[0:v]fps={FPS},scale={int(W * k)}:{int(H * k)}:force_original_aspect_ratio=increase," \
-              f"crop={int(W * k)}:{int(H * k)},setsar=1{flip},{_zoompan(scene.camera, frames, k, seed, 1)}"
+              f"crop={int(W * k)}:{int(H * k)},setsar=1{flip},{_zoompan(move, frames, k, seed, 1, punch)}"
     else:
         k = 2.0
-        inputs = ["-i", str(asset.path)]
+        inputs = ["-i", str(path or asset.path)]
         src = f"[0:v]scale={int(W * k)}:{int(H * k)}:force_original_aspect_ratio=increase," \
-              f"crop={int(W * k)}:{int(H * k)},setsar=1{flip},{_zoompan(scene.camera, frames, k, seed, frames)}"
+              f"crop={int(W * k)}:{int(H * k)},setsar=1{flip},{_zoompan(move, frames, k, seed, frames, punch)}"
 
     grade = f",{channel.grade}" if channel.grade else ""
     if asset.sprite is not None:
@@ -222,6 +243,12 @@ def _final_pass(base: Path, narration: Path, subs: Path, channel: ChannelConfig,
     else:
         graph.append("[key]anullsink")
 
+    if channel.ambience == "wind":  # brown noise, band-limited and slowly breathing: distant wind and sea
+        args += ["-f", "lavfi", "-t", f"{total:.3f}", "-i", "anoisesrc=color=brown:amplitude=0.6:r=48000"]
+        graph.append(f"[{next_input}:a]{AUDIO_FMT},lowpass=f=420,highpass=f=60,tremolo=f=0.13:d=0.6,volume=0.10[amb]")
+        mix.append("[amb]")
+        next_input += 1
+
     for n, (name, t, vol) in enumerate(events):
         sfx = media / "sfx" / f"{name}.wav"
         if not sfx.exists():
@@ -257,14 +284,37 @@ def render_video(script: VideoScript, assets: list[SceneAsset], narration: Path,
     log.info("[%s] %d scenes, %.2fs total, scene lengths %.2f-%.2fs", channel.id, len(frames), total,
              min(frames) / FPS, max(frames) / FPS)
 
+    counts = [len(s.narration.split()) for s in script.scenes]
+    # Loop: the very last shot reuses the opening image, so the end flows straight back into frame 0
+    last = len(assets) - 1
+    if assets[0].kind == "image" and assets[last].second is not None:
+        assets[last].second = assets[0].path
+
     clips_dir = workdir / "clips"
     clips_dir.mkdir(exist_ok=True)
     jobs = []
     with ThreadPoolExecutor(max_workers=get_settings().render_threads) as pool:
         for i, (asset, scene, n) in enumerate(zip(assets, script.scenes, frames)):
             mirror = i > 0 and asset.path == assets[i - 1].path  # reused asset: flip so it reads as a new shot
-            jobs.append(pool.submit(_render_scene, i, asset, scene, n, channel, clips_dir / f"scene_{i:02d}.mp4", mirror))
+            punch = i > 0 and scene.sfx == TransitionSfx.IMPACT
+            if asset.second is None:
+                jobs.append(pool.submit(_render_scene, i, asset, scene, n, channel,
+                                        clips_dir / f"scene_{i:02d}.mp4", mirror, punch=punch))
+                continue
+            first = split_frame(i, starts[i], n, counts, words)
+            jobs.append(pool.submit(_render_scene, i, asset, scene, first, channel,
+                                    clips_dir / f"scene_{i:02d}a.mp4", mirror, punch=punch))
+            jobs.append(pool.submit(_render_scene, i + 100, asset, scene, n - first, channel,
+                                    clips_dir / f"scene_{i:02d}b.mp4", False, asset.second,
+                                    COUNTER_MOVE[scene.camera]))
         clips = [job.result() for job in jobs]
+
+    # Callouts slam in at their scene's cut; impact beats get a white flash
+    callouts = [(0.0 if i == 0 else starts[i] + 0.1, min(starts[i] + 2.6, starts[i] + frames[i] / FPS - 0.1),
+                 s.callout) for i, s in enumerate(script.scenes) if s.callout]
+    flashes = [starts[i] for i, s in enumerate(script.scenes) if i > 0 and s.sfx == TransitionSfx.IMPACT]
+    add_overlays(subs, channel.subtitle, callouts, flashes)
+    events = _sfx_events(script.scenes, starts, assets) + [("pop", t, 0.35) for t, _, _ in callouts if t > 0]
 
     concat_list = workdir / "concat.txt"
     concat_list.write_text("".join(f"file '{c.as_posix()}'\n" for c in clips), encoding="utf-8")
@@ -272,7 +322,7 @@ def render_video(script: VideoScript, assets: list[SceneAsset], narration: Path,
     run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(concat_list), "-c", "copy", str(base)])
 
     final = workdir / "final.mp4"
-    _final_pass(base, narration, subs, channel, _sfx_events(script.scenes, starts, assets), total, final, workdir)
+    _final_pass(base, narration, subs, channel, events, total, final, workdir)
     duration = probe_duration(final)
     if not channel.min_duration - 0.1 <= duration <= channel.max_duration + 0.1:
         raise RenderError(f"Final duration {duration:.2f}s outside [{channel.min_duration}, {channel.max_duration}]")
