@@ -74,6 +74,22 @@ python main_cli.py --auth-tiktok
 
 ---
 
+## Estratégia (10/11/2026): esteira em pausa
+
+A premissa de monetização deste projeto mudou. Detalhes no guia de operação do repositório
+`AutomationRealOficial` (`docs/guia_operacao_2026-11.md`).
+
+- **Shorts sozinhos não pagam mais.** A partir de 01/02/2027 o YouTube só divide receita de Shorts com canais que
+  têm 10 milhões de views qualificadas em 90 dias. A duração de 62 a 68 s "por elegibilidade de monetização" deixou
+  de valer como estratégia.
+- **Cinco canais diários com o mesmo molde** é o perfil que a regra de conteúdo inautêntico (produzido em massa,
+  enredo de molde) descreve. Não ligar os cinco. Se a esteira voltar, é com um canal, como chamada em Shorts para um
+  canal de vídeos longos originais.
+- **`DRY_RUN=true` é o padrão do `env.example`** e os workers ficam parados.
+- **TikTok desligado em todos os canais** (`"tiktok": {"enabled": false}`). O `tiktok_playwright.py` posta por
+  navegador automatizado, fora das regras do TikTok. O caminho permitido é a Content Posting API (app sem auditoria só
+  publica em modo privado; marcar `is_aigc` em vídeo gerado por IA) ou postar pelo aplicativo.
+
 ## Status (21/10/2026)
 
 **Testado de verdade (Docker, chaves reais):** roteiro → narração → legenda → 16 imagens → render,

@@ -211,7 +211,7 @@ class YouTubeConfig(BaseModel):
 
 
 class TikTokConfig(BaseModel):
-    enabled: bool = True
+    enabled: bool = False       # opt-in: the Playwright uploader is outside TikTok's rules (README, "Estratégia")
     profile_dir: str
     proxy: str | None = None  # e.g. "http://user:pass@host:port"
 

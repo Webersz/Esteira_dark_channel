@@ -41,7 +41,7 @@
       "prompt_guidelines": "Tom de documentário investigativo, frases curtas e tensas. Cite nomes, datas e lugares reais. Nunca invente fatos.",
       "hashtags": ["#misterio", "#historia", "#curiosidades", "#shorts"],
       "youtube": { "enabled": true, "token_file": "yt_tokens/yt_nicho_1.json", "category_id": "27" },
-      "tiktok": { "enabled": true, "profile_dir": "tiktok_profiles/nicho_1", "proxy": null }
+      "tiktok": { "enabled": false, "profile_dir": "tiktok_profiles/nicho_1", "proxy": null }
     },
     {
       "id": "nicho_2",
@@ -60,7 +60,7 @@
       "prompt_guidelines": "Tom divertido, curioso e surpreendente. Use 'você' para falar direto com o espectador. Fatos científicos verificáveis.",
       "hashtags": ["#curiosidades", "#ciencia", "#vocesabia", "#shorts"],
       "youtube": { "enabled": true, "token_file": "yt_tokens/yt_nicho_2.json", "category_id": "28" },
-      "tiktok": { "enabled": true, "profile_dir": "tiktok_profiles/nicho_2", "proxy": null }
+      "tiktok": { "enabled": false, "profile_dir": "tiktok_profiles/nicho_2", "proxy": null }
     },
     {
       "id": "nicho_3",
@@ -79,7 +79,7 @@
       "prompt_guidelines": "Tom intrigante e confiante. Baseie-se em estudos reais (cite o pesquisador ou o experimento). Sem promessas de manipulação.",
       "hashtags": ["#psicologia", "#mente", "#comportamento", "#shorts"],
       "youtube": { "enabled": true, "token_file": "yt_tokens/yt_nicho_3.json", "category_id": "27" },
-      "tiktok": { "enabled": true, "profile_dir": "tiktok_profiles/nicho_3", "proxy": null }
+      "tiktok": { "enabled": false, "profile_dir": "tiktok_profiles/nicho_3", "proxy": null }
     },
     {
       "id": "nicho_4",
@@ -98,7 +98,7 @@
       "prompt_guidelines": "Tom empolgado e engraçado, com comparações absurdas (ex: 'é como se você pulasse um prédio'). Fatos biológicos reais.",
       "hashtags": ["#animais", "#natureza", "#curiosidades", "#shorts"],
       "youtube": { "enabled": true, "token_file": "yt_tokens/yt_nicho_4.json", "category_id": "15" },
-      "tiktok": { "enabled": true, "profile_dir": "tiktok_profiles/nicho_4", "proxy": null }
+      "tiktok": { "enabled": false, "profile_dir": "tiktok_profiles/nicho_4", "proxy": null }
     },
     {
       "id": "nicho_5",
@@ -118,7 +118,7 @@
       "prompt_guidelines": "Primeira pessoa, presente do indicativo, suspense crescente, reviravolta na cena 15 e frase final que conecta com a primeira (loop).",
       "hashtags": ["#terror", "#creepypasta", "#historiasdeterror", "#shorts"],
       "youtube": { "enabled": true, "token_file": "yt_tokens/yt_nicho_5.json", "category_id": "24" },
-      "tiktok": { "enabled": true, "profile_dir": "tiktok_profiles/nicho_5", "proxy": null }
+      "tiktok": { "enabled": false, "profile_dir": "tiktok_profiles/nicho_5", "proxy": null }
     }
   ]
 }
